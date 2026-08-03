@@ -575,6 +575,8 @@ export interface AgentDefinitionProjection {
   fallback_count: number
   identity: 'profile' | 'replace'
   model: null | string
+  tools_allow: null | string[]
+  mcp_allow: null | string[]
   name: string
   provider: null | string
   relative_path: string

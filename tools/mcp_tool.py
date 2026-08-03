@@ -4133,6 +4133,12 @@ _parallel_safe_servers: set = set()
 # on parsing or re-sanitizing the generated name.
 _mcp_tool_server_names: Dict[str, str] = {}
 
+# First successful raw owner for each normalized MCP registry name. Entries are
+# intentionally retained after disconnect: otherwise a differently spelled raw
+# server (for example ``team-a`` vs ``team_a``) could inherit an already-issued
+# exact-name capability after the original owner disappears.
+_mcp_tool_server_history: Dict[str, str] = {}
+
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
@@ -5719,6 +5725,14 @@ def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
     """Remember the exact raw MCP server that registered *tool_name*."""
     with _lock:
         _mcp_tool_server_names[tool_name] = server_name
+        _mcp_tool_server_history.setdefault(tool_name, server_name)
+
+
+def _mcp_tool_owner_conflicts(tool_name: str, server_name: str) -> bool:
+    """Return whether a normalized name was previously owned by another server."""
+    with _lock:
+        previous = _mcp_tool_server_history.get(tool_name)
+        return previous is not None and previous != server_name
 
 
 def _forget_mcp_tool_server(tool_name: str) -> None:
@@ -5940,6 +5954,16 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     for candidate in unique_candidates:
         registry_name = candidate["registry_name"]
         if registry_name in ambiguous_names:
+            continue
+
+        if _mcp_tool_owner_conflicts(registry_name, name):
+            logger.error(
+                "MCP server '%s': %s normalizes to previously owned name '%s'; "
+                "skipping to prevent capability substitution",
+                name,
+                candidate["origin"],
+                registry_name,
+            )
             continue
 
         existing_toolset = registry.get_toolset_for_tool(registry_name)
@@ -6716,6 +6740,12 @@ def get_registered_mcp_server_names() -> set:
         return set(_mcp_tool_server_names.values())
 
 
+def get_mcp_server_for_tool(tool_name: str) -> Optional[str]:
+    """Return the exact raw MCP server owning a registered tool, if any."""
+    with _lock:
+        return _mcp_tool_server_names.get(tool_name)
+
+
 
 def refresh_agent_mcp_tools(
     agent,
@@ -6794,7 +6824,51 @@ def refresh_agent_mcp_tools(
         )
         or []
     )
+    exact_allowlist = getattr(agent, "_exact_tool_allowlist", None)
+    if exact_allowlist is not None:
+        from tools.tool_search import assemble_tool_defs
+
+        authorized_mcp_owners = dict(
+            getattr(agent, "_exact_mcp_tool_owners", {}) or {}
+        )
+
+        raw_defs = list(
+            get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=disabled,
+                quiet_mode=quiet_mode,
+                skip_tool_search_assembly=True,
+            )
+            or []
+        )
+        raw_defs = [
+            tool
+            for tool in raw_defs
+            if (
+                (name := (tool.get("function") or {}).get("name"))
+                in exact_allowlist
+                and (
+                    name not in authorized_mcp_owners
+                    or get_mcp_server_for_tool(name)
+                    == authorized_mcp_owners[name]
+                )
+            )
+        ]
+        surviving_raw_names = {
+            (tool.get("function") or {}).get("name") for tool in raw_defs
+        }
+        exact_allowlist = frozenset(
+            name
+            for name in exact_allowlist
+            if name not in authorized_mcp_owners or name in surviving_raw_names
+        )
+        new_defs = assemble_tool_defs(raw_defs).tool_defs
     new_names = {t["function"]["name"] for t in new_defs}
+    authority_names = (
+        set(exact_allowlist) | new_names
+        if exact_allowlist is not None
+        else new_names
+    )
 
     # Re-append the post-build injected families that get_tool_definitions does
     # NOT reproduce, so a refresh never strips them (memory-provider + context-
@@ -6804,7 +6878,11 @@ def refresh_agent_mcp_tools(
     # (``build_api_kwargs``) can't see a partial rebuild or a cross-attribute
     # half-swap. ``staged_engine_names`` are the context-engine routing names
     # this rebuild actually appended (matching agent_init's dedup-aware add).
-    staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+    staged_engine_names = (
+        set()
+        if exact_allowlist is not None
+        else _reinject_post_build_tools(agent, new_defs, new_names)
+    )
 
     # Single atomic read-diff-publish so the returned ``added`` is consistent
     # with what was actually published, even under concurrent callers, and a
@@ -6823,13 +6901,15 @@ def refresh_agent_mcp_tools(
             t["function"]["name"]
             for t in (getattr(agent, "tools", None) or [])
         }
-        if new_names == current:
+        current_authority = set(getattr(agent, "valid_tool_names", ()) or ())
+        if new_names == current and authority_names == current_authority:
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
             return set()
         agent.tools = new_defs
-        agent.valid_tool_names = new_names
+        agent.valid_tool_names = authority_names
+        agent._raw_authorized_tool_names = set(authority_names)
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):

@@ -31,14 +31,39 @@ MAX_DESCRIPTION_CHARS = 160
 MAX_BODY_BYTES = 24 * 1024
 MAX_ROUTE_IDENTIFIER_CHARS = 128
 MAX_FALLBACKS = 4
+MAX_TOOL_IDENTIFIERS = 128
+MAX_MCP_SERVERS = 32
 MAX_NAME_CHARS = 64
 
 _NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _INTERPOLATION_RE = re.compile(r"\$\{|\{\{")
-_ALLOWED_FIELDS = frozenset({"name", "description", "identity", "provider", "model", "fallbacks"})
+_ALLOWED_FIELDS = frozenset(
+    {"name", "description", "identity", "provider", "model", "fallbacks", "tools", "mcp"}
+)
 _ALLOWED_ROUTE_FIELDS = frozenset({"provider", "model"})
+_ALLOWED_RESTRICTION_FIELDS = frozenset({"allow"})
 _SNAPSHOT_KEY_FILE = ".agent-catalog-signing-key"
 _SNAPSHOT_KEY_BYTES = 32
+_SNAPSHOT_KEY_OPEN_RETRIES = 8
+
+
+def _require_owned_restrictive(info: os.stat_result, label: str) -> None:
+    """Require system-authority paths to be owned by this process and not writable by peers."""
+
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is not None and info.st_uid != geteuid():
+        _fail(f"{label} is not owned by the current user", "SECURE_AGENT_LOAD_UNAVAILABLE")
+    if info.st_mode & 0o022:
+        _fail(f"{label} is group/world writable", "SECURE_AGENT_LOAD_UNAVAILABLE")
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(fd, data[offset:])
+        if written <= 0:
+            raise OSError("short write while publishing agent catalog key")
+        offset += written
 
 
 class AgentDefinitionError(ValueError):
@@ -60,32 +85,58 @@ def _catalog_snapshot_key(profile_root: Path, *, create: bool) -> bytes:
     except OSError as exc:
         raise AgentDefinitionError("SECURE_AGENT_LOAD_UNAVAILABLE", "agent catalog signing root is unavailable") from exc
     try:
+        _require_owned_restrictive(os.fstat(root_fd), "agent catalog signing root")
         try:
             fd = os.open(_SNAPSHOT_KEY_FILE, file_flags, dir_fd=root_fd)
         except FileNotFoundError:
             if not create:
                 _fail("stored agent catalog signing key is unavailable", "STALE_AGENT_DEFINITION")
+            temporary_name = f".{_SNAPSHOT_KEY_FILE}.{secrets.token_hex(8)}.tmp"
             try:
-                fd = os.open(
-                    _SNAPSHOT_KEY_FILE,
+                temporary_fd = os.open(
+                    temporary_name,
                     os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
                     0o600,
                     dir_fd=root_fd,
                 )
-            except FileExistsError:
-                fd = os.open(_SNAPSHOT_KEY_FILE, file_flags, dir_fd=root_fd)
-            else:
                 key = secrets.token_bytes(_SNAPSHOT_KEY_BYTES)
                 try:
-                    os.write(fd, key)
-                    os.fsync(fd)
+                    _write_all(temporary_fd, key)
+                    os.fsync(temporary_fd)
                 finally:
-                    os.close(fd)
-                fd = os.open(_SNAPSHOT_KEY_FILE, file_flags, dir_fd=root_fd)
+                    os.close(temporary_fd)
+                try:
+                    os.link(
+                        temporary_name,
+                        _SNAPSHOT_KEY_FILE,
+                        src_dir_fd=root_fd,
+                        dst_dir_fd=root_fd,
+                        follow_symlinks=False,
+                    )
+                    os.fsync(root_fd)
+                except FileExistsError:
+                    pass
+            finally:
+                try:
+                    os.unlink(temporary_name, dir_fd=root_fd)
+                except FileNotFoundError:
+                    pass
+            fd = os.open(_SNAPSHOT_KEY_FILE, file_flags, dir_fd=root_fd)
         try:
             info = os.fstat(fd)
+            # A concurrent first creator publishes with link(2) and immediately
+            # removes its private temporary name. Retry that narrow transient;
+            # persistent hard links still fail closed after the bounded wait.
+            for _ in range(_SNAPSHOT_KEY_OPEN_RETRIES):
+                if info.st_nlink == 1 or info.st_nlink != 2:
+                    break
+                import time
+
+                time.sleep(0.001)
+                info = os.fstat(fd)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_mode & 0o077:
                 _fail("agent catalog signing key is insecure", "SECURE_AGENT_LOAD_UNAVAILABLE")
+            _require_owned_restrictive(info, "agent catalog signing key")
             key = os.read(fd, _SNAPSHOT_KEY_BYTES + 1)
         finally:
             os.close(fd)
@@ -116,6 +167,8 @@ class AgentDefinition:
     provider: str | None
     model: str | None
     fallbacks: tuple[AgentFallbackRoute, ...] | None
+    tools_allow: tuple[str, ...] | None
+    mcp_allow: tuple[str, ...] | None
     relative_path: str
     full_digest: str
 
@@ -163,7 +216,7 @@ class AgentCatalog:
     def project(self) -> dict[str, Any]:
         """Return the single allowlisted projection consumed by every UI."""
         return {
-            "version": 1,
+            "version": 2,
             "revision": self.revision,
             "definitions": [
                 {
@@ -174,6 +227,16 @@ class AgentCatalog:
                     "provider": entry.definition.provider,
                     "model": entry.definition.model,
                     "fallback_count": len(entry.definition.fallbacks or ()),
+                    "tools_allow": (
+                        None
+                        if entry.definition.tools_allow is None
+                        else list(entry.definition.tools_allow)
+                    ),
+                    "mcp_allow": (
+                        None
+                        if entry.definition.mcp_allow is None
+                        else list(entry.definition.mcp_allow)
+                    ),
                     "relative_path": entry.definition.relative_path,
                     "digest": entry.definition.full_digest,
                 }
@@ -222,7 +285,40 @@ def _bounded_identifier(value: Any, field: str) -> str:
         )
     if any(ord(char) < 0x20 for char in value):
         _fail(f"{field} contains control characters")
+    if value == "inherit":
+        _fail(
+            f"{field} cannot use the reserved inherit sentinel; omit the field to inherit",
+            "AGENT_ROUTE_INVALID",
+        )
     return value
+
+
+def _parse_allowlist(
+    value: Any,
+    *,
+    field: str,
+    limit: int,
+    error_code: str,
+) -> tuple[str, ...] | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        _fail(f"{field} must be a mapping containing allow", error_code)
+    unknown = set(value) - _ALLOWED_RESTRICTION_FIELDS
+    if unknown:
+        _fail(f"unsupported {field} field: {sorted(unknown)[0]}", "AGENT_FIELD_UNSUPPORTED")
+    raw = value.get("allow")
+    if not isinstance(raw, list) or len(raw) > limit:
+        _fail(f"{field}.allow must be a bounded list", error_code)
+    result: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw):
+        identifier = _bounded_identifier(item, f"{field}.allow[{index}]")
+        if identifier in seen:
+            _fail(f"{field}.allow entries must be unique", error_code)
+        seen.add(identifier)
+        result.append(identifier)
+    return tuple(result)
 
 
 def _split_frontmatter(raw: bytes) -> tuple[bytes, bytes]:
@@ -254,7 +350,9 @@ def parse_agent_definition(raw_bytes: bytes, relative_path: Path | str) -> Agent
         _fail("agent definition is not valid UTF-8")
 
     frontmatter_bytes, body_bytes = _split_frontmatter(raw_bytes)
-    if any(token in frontmatter_bytes for token in (b"&", b"*", b"!!", b"!unsafe", b"<<:")):
+    if re.search(rb"(?m)(?:^|[\s\[\]{},])(?:&|\*)[A-Za-z0-9_-]+", frontmatter_bytes) or any(
+        token in frontmatter_bytes for token in (b"!!", b"!unsafe", b"<<:")
+    ):
         _fail("agent definition uses unsupported YAML features", "AGENT_FIELD_UNSUPPORTED")
     try:
         metadata = yaml.load(frontmatter_bytes.decode("utf-8"), Loader=_StrictLoader)
@@ -299,16 +397,33 @@ def parse_agent_definition(raw_bytes: bytes, relative_path: Path | str) -> Agent
         if not isinstance(fallbacks_value, list) or len(fallbacks_value) > MAX_FALLBACKS:
             _fail("fallbacks must be a bounded list", "AGENT_FALLBACK_INVALID")
         parsed_routes: list[AgentFallbackRoute] = []
+        seen_routes: set[tuple[str, str]] = set()
         for route in fallbacks_value:
             if not isinstance(route, dict) or set(route) != _ALLOWED_ROUTE_FIELDS:
                 _fail("fallback route must contain only provider and model", "AGENT_FALLBACK_INVALID")
-            parsed_routes.append(
-                AgentFallbackRoute(
-                    provider=_bounded_identifier(route["provider"], "fallback.provider"),
-                    model=_bounded_identifier(route["model"], "fallback.model"),
-                )
+            parsed = AgentFallbackRoute(
+                provider=_bounded_identifier(route["provider"], "fallback.provider"),
+                model=_bounded_identifier(route["model"], "fallback.model"),
             )
+            key = (parsed.provider, parsed.model)
+            if key in seen_routes or (provider is not None and model is not None and key == (provider, model)):
+                _fail("fallback routes must be unique and distinct from the primary route", "AGENT_FALLBACK_INVALID")
+            seen_routes.add(key)
+            parsed_routes.append(parsed)
         fallbacks = tuple(parsed_routes)
+
+    tools_allow = _parse_allowlist(
+        metadata.get("tools"),
+        field="tools",
+        limit=MAX_TOOL_IDENTIFIERS,
+        error_code="AGENT_TOOL_RESTRICTION_INVALID",
+    )
+    mcp_allow = _parse_allowlist(
+        metadata.get("mcp"),
+        field="mcp",
+        limit=MAX_MCP_SERVERS,
+        error_code="AGENT_MCP_RESTRICTION_INVALID",
+    )
 
     try:
         body_text = body_bytes.decode("utf-8").strip()
@@ -316,6 +431,13 @@ def parse_agent_definition(raw_bytes: bytes, relative_path: Path | str) -> Agent
         _fail("agent body is not valid UTF-8")
     if not body_text or len(body_text.encode("utf-8")) > MAX_BODY_BYTES:
         _fail("agent body must be non-empty and within its limit")
+    from tools.threat_patterns import scan_for_threats
+
+    if scan_for_threats(f"{description}\n{body_text}", scope="strict"):
+        _fail(
+            "agent system-authority content matches a threat pattern",
+            "AGENT_INSTRUCTION_THREAT_DETECTED",
+        )
 
     relative = Path(relative_path).as_posix()
     if Path(relative).is_absolute() or relative == ".." or relative.startswith("../"):
@@ -331,6 +453,8 @@ def parse_agent_definition(raw_bytes: bytes, relative_path: Path | str) -> Agent
         provider=provider,
         model=model,
         fallbacks=fallbacks,
+        tools_allow=tools_allow,
+        mcp_allow=mcp_allow,
         relative_path=relative,
         full_digest=hashlib.sha256(raw_bytes).hexdigest(),
     )
@@ -358,6 +482,7 @@ def _read_relative_regular_file(
         root_fd = os.open(agents_root, directory_flags)
         descriptors.append(root_fd)
         root_stat = os.fstat(root_fd)
+        _require_owned_restrictive(root_stat, "agents root")
         if expected_root_identity is not None and (root_stat.st_dev, root_stat.st_ino) != expected_root_identity:
             _fail("agent root identity changed", "STALE_AGENT_DEFINITION")
 
@@ -365,6 +490,7 @@ def _read_relative_regular_file(
         for component in relative_path.parts[:-1]:
             parent_fd = os.open(component, directory_flags, dir_fd=parent_fd)
             descriptors.append(parent_fd)
+            _require_owned_restrictive(os.fstat(parent_fd), "agent path ancestor")
         descriptor = os.open(relative_path.name, file_flags, dir_fd=parent_fd)
         descriptors.append(descriptor)
         before = os.fstat(descriptor)
@@ -372,6 +498,7 @@ def _read_relative_regular_file(
             _fail("agent definition is not a regular file", "SECURE_AGENT_LOAD_UNAVAILABLE")
         if before.st_nlink != 1:
             _fail("hard-linked agent definitions are not allowed", "SECURE_AGENT_LOAD_UNAVAILABLE")
+        _require_owned_restrictive(before, "agent definition")
         data = os.read(descriptor, MAX_AGENT_FILE_BYTES + 1)
         after = os.fstat(descriptor)
     except AgentDefinitionError:
@@ -427,6 +554,11 @@ def discover_profile_agents(profile_root: Path | str) -> AgentCatalog:
 
     profile = Path(profile_root).absolute()
     agents_root = profile / "agents"
+    try:
+        profile_stat = profile.stat()
+    except OSError:
+        _fail("profile root is unavailable", "SECURE_AGENT_LOAD_UNAVAILABLE")
+    _require_owned_restrictive(profile_stat, "profile root")
     if not agents_root.exists():
         return AgentCatalog(profile, agents_root, (), hashlib.sha256(b"").hexdigest())
     _reject_link(agents_root)
@@ -511,10 +643,22 @@ def discover_profile_agents(profile_root: Path | str) -> AgentCatalog:
 def reload_catalog_entry(entry: AgentCatalogEntry) -> AgentDefinition:
     """Securely reload and revalidate one immutable catalog entry."""
 
-    if entry.persisted:
-        return entry.definition
-
     agents_root = entry.path.parents[len(Path(entry.definition.relative_path).parts) - 1]
+    if entry.persisted:
+        current_catalog = discover_profile_agents(agents_root.parent)
+        current_entry = current_catalog.get(entry.definition.name)
+        if (
+            current_entry is None
+            or current_entry.definition.relative_path != entry.definition.relative_path
+            or current_entry.definition.full_digest != entry.definition.full_digest
+        ):
+            _fail("persisted agent definition is no longer current", "STALE_AGENT_DEFINITION")
+        return current_entry.definition
+
+    current_catalog = discover_profile_agents(agents_root.parent)
+    current_entry = current_catalog.get(entry.definition.name)
+    if current_entry is None or current_entry.definition.relative_path != entry.definition.relative_path:
+        _fail("agent catalog membership changed", "STALE_AGENT_DEFINITION")
     raw, current, _root_stat = _read_relative_regular_file(
         agents_root,
         Path(entry.definition.relative_path),
@@ -553,6 +697,12 @@ def snapshot_agent_catalog(catalog: AgentCatalog) -> dict[str, Any]:
                     for route in definition.fallbacks
                 ]
             ),
+            "tools_allow": (
+                None if definition.tools_allow is None else list(definition.tools_allow)
+            ),
+            "mcp_allow": (
+                None if definition.mcp_allow is None else list(definition.mcp_allow)
+            ),
             "relative_path": definition.relative_path,
             "full_digest": definition.full_digest,
         }
@@ -564,6 +714,9 @@ def snapshot_agent_catalog(catalog: AgentCatalog) -> dict[str, Any]:
         "revision": catalog.revision,
         "definitions": [snapshot_definition(entry) for entry in catalog.entries],
     }
+    if not catalog.entries:
+        snapshot["catalog_mac"] = None
+        return snapshot
     snapshot["catalog_mac"] = _snapshot_mac(
         snapshot,
         _catalog_snapshot_key(catalog.profile_root, create=True),
@@ -583,13 +736,18 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
     profile = Path(profile_root).absolute()
     catalog_mac = snapshot.get("catalog_mac")
     unsigned_snapshot = {key: value for key, value in snapshot.items() if key != "catalog_mac"}
-    expected_mac = _snapshot_mac(
-        unsigned_snapshot,
-        _catalog_snapshot_key(profile, create=False),
-    )
-    if not isinstance(catalog_mac, str) or not hmac.compare_digest(catalog_mac, expected_mac):
-        _fail("stored agent catalog authentication failed", "STALE_AGENT_DEFINITION")
     definitions = snapshot.get("definitions")
+    if definitions == [] and catalog_mac is None:
+        expected_mac = None
+    else:
+        expected_mac = _snapshot_mac(
+            unsigned_snapshot,
+            _catalog_snapshot_key(profile, create=False),
+        )
+    if expected_mac is not None and (
+        not isinstance(catalog_mac, str) or not hmac.compare_digest(catalog_mac, expected_mac)
+    ):
+        _fail("stored agent catalog authentication failed", "STALE_AGENT_DEFINITION")
     revision = snapshot.get("revision")
     if not isinstance(definitions, list) or len(definitions) > MAX_AGENT_FILES:
         _fail("stored agent catalog snapshot exceeds its limit", "STALE_AGENT_DEFINITION")
@@ -608,6 +766,8 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
             "provider",
             "model",
             "fallbacks",
+            "tools_allow",
+            "mcp_allow",
             "relative_path",
             "full_digest",
             "snapshot_digest",
@@ -648,6 +808,18 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
                 for route in fallback_values
             )
         )
+        tools_allow = _parse_allowlist(
+            None if raw["tools_allow"] is None else {"allow": raw["tools_allow"]},
+            field="tools",
+            limit=MAX_TOOL_IDENTIFIERS,
+            error_code="STALE_AGENT_DEFINITION",
+        )
+        mcp_allow = _parse_allowlist(
+            None if raw["mcp_allow"] is None else {"allow": raw["mcp_allow"]},
+            field="mcp",
+            limit=MAX_MCP_SERVERS,
+            error_code="STALE_AGENT_DEFINITION",
+        )
         relative = Path(str(raw["relative_path"]))
         definition = AgentDefinition(
             name=str(raw["name"]),
@@ -657,6 +829,8 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
             provider=raw["provider"],
             model=raw["model"],
             fallbacks=fallbacks,
+            tools_allow=tools_allow,
+            mcp_allow=mcp_allow,
             relative_path=relative.as_posix(),
             full_digest=str(raw["full_digest"]),
         )
@@ -675,6 +849,8 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
                         if fallbacks is not None
                         else {}
                     ),
+                    **({"tools": {"allow": list(tools_allow)}} if tools_allow is not None else {}),
+                    **({"mcp": {"allow": list(mcp_allow)}} if mcp_allow is not None else {}),
                 }
             )
             + "\n---\n"
@@ -724,6 +900,8 @@ __all__ = [
     "MAX_BODY_BYTES",
     "MAX_ROUTE_IDENTIFIER_CHARS",
     "MAX_FALLBACKS",
+    "MAX_TOOL_IDENTIFIERS",
+    "MAX_MCP_SERVERS",
     "AgentDefinitionError",
     "AgentFallbackRoute",
     "AgentDefinition",

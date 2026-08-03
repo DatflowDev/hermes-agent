@@ -13,6 +13,8 @@ interface AgentDefinitionProjection {
   provider: string | null
   model: string | null
   fallback_count: number
+  tools_allow: string[] | null
+  mcp_allow: string[] | null
   relative_path: string
   digest: string
 }
@@ -136,6 +138,9 @@ export function AgentDefinitions() {
             </div>
             <p className="mt-2 truncate font-mono text-[0.65rem] text-muted-foreground/75">
               {route} · {definition.fallback_count} fallback{definition.fallback_count === 1 ? '' : 's'} · {definition.relative_path}
+            </p>
+            <p className="mt-1 truncate font-mono text-[0.65rem] text-muted-foreground/75">
+              tools: {definition.tools_allow?.join(', ') ?? 'inherit'} · MCP: {definition.mcp_allow?.join(', ') ?? 'inherit'}
             </p>
             <div className="mt-2 flex gap-2">
               <input

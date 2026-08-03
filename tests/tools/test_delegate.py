@@ -258,6 +258,137 @@ class TestStripBlockedTools(unittest.TestCase):
 
 
 class TestDelegateTask(unittest.TestCase):
+    def test_exact_allowlist_reduces_child_to_parent_intersection(self):
+        parent = _make_mock_parent(depth=0)
+        child = MagicMock()
+        child.tools = [
+            {"type": "function", "function": {"name": "web_search"}},
+            {"type": "function", "function": {"name": "terminal"}},
+            {"type": "function", "function": {"name": "mcp_context7_query"}},
+        ]
+
+        with patch("run_agent.AIAgent", return_value=child):
+            built = _build_child_agent(
+                task_index=0,
+                goal="Research",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                exact_tool_allowlist={"web_search", "mcp_context7_query"},
+            )
+
+        names = {tool["function"]["name"] for tool in built.tools}
+        self.assertEqual(names, {"web_search", "mcp_context7_query"})
+        self.assertNotIn("terminal", built.valid_tool_names)
+        self.assertIn("mcp_context7_query", built.valid_tool_names)
+        self.assertEqual(
+            built._exact_tool_allowlist,
+            frozenset({"web_search", "mcp_context7_query"}),
+        )
+
+    def test_unrestricted_nested_child_retains_parent_exact_authority(self):
+        parent = _make_mock_parent(depth=0)
+        parent._exact_tool_allowlist = frozenset({"delegate_task", "read_file"})
+        child = MagicMock()
+        child.tools = [
+            {"type": "function", "function": {"name": "delegate_task"}},
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "terminal"}},
+        ]
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=3),
+        ):
+            built = _build_child_agent(
+                task_index=0,
+                goal="Inspect",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="orchestrator",
+            )
+
+        self.assertEqual(
+            built._exact_tool_allowlist,
+            frozenset({"delegate_task", "read_file"}),
+        )
+        self.assertNotIn("terminal", built.valid_tool_names)
+
+    def test_unrestricted_nested_child_uses_parent_raw_snapshot(self):
+        parent = _make_mock_parent(depth=0)
+        parent._exact_tool_allowlist = None
+        parent._raw_authorized_tool_names = frozenset({"delegate_task", "read_file"})
+        child = MagicMock()
+        child.tools = [
+            {"type": "function", "function": {"name": "delegate_task"}},
+            {"type": "function", "function": {"name": "read_file"}},
+            {"type": "function", "function": {"name": "terminal"}},
+        ]
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=3),
+        ):
+            built = _build_child_agent(
+                task_index=0,
+                goal="Inspect",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="orchestrator",
+            )
+
+        self.assertEqual(
+            built._exact_tool_allowlist,
+            frozenset({"delegate_task", "read_file"}),
+        )
+        self.assertNotIn("terminal", built.valid_tool_names)
+
+    def test_nested_child_revokes_mcp_name_replaced_by_plugin(self):
+        parent = _make_mock_parent(depth=0)
+        tool_name = "mcp__assurance_a__status"
+        parent._exact_tool_allowlist = frozenset({"delegate_task", tool_name})
+        parent._exact_mcp_tool_owners = {tool_name: "assurance-a"}
+        child = MagicMock()
+        child.tools = [
+            {"type": "function", "function": {"name": "delegate_task"}},
+            {"type": "function", "function": {"name": tool_name}},
+        ]
+
+        with (
+            patch("run_agent.AIAgent", return_value=child),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=3),
+            patch("tools.mcp_tool.get_mcp_server_for_tool", return_value=None),
+        ):
+            built = _build_child_agent(
+                task_index=0,
+                goal="Inspect",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                role="orchestrator",
+            )
+
+        self.assertNotIn(tool_name, built.valid_tool_names)
+        self.assertNotIn(tool_name, built._exact_tool_allowlist)
+        self.assertNotIn(tool_name, built._exact_mcp_tool_owners)
+
     def test_selected_profile_identity_and_route_are_pinned_into_child(self):
         parent = _make_mock_parent(depth=0)
         definition = SimpleNamespace(
@@ -504,6 +635,83 @@ class TestDelegateTask(unittest.TestCase):
             "You are the immutable release reviewer.",
             kwargs["ephemeral_system_prompt"],
         )
+
+    def test_declared_tool_must_exist_in_parent_authority(self):
+        import tempfile
+
+        parent = _make_mock_parent(depth=0)
+        parent.enabled_toolsets = ["web"]
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        profile = Path(temp_dir.name)
+        agents = profile / "agents"
+        agents.mkdir()
+        (agents / "reviewer.md").write_text(
+            "---\n"
+            "name: reviewer\n"
+            "description: Review releases\n"
+            "identity: replace\n"
+            "tools:\n"
+            "  allow: [terminal]\n"
+            "---\n"
+            "Review safely.\n"
+        )
+        parent._agent_catalog = discover_profile_agents(profile)
+
+        with patch("tools.delegate_tool._build_child_preserving_parent_tools") as build:
+            result = json.loads(
+                delegate_task(
+                    goal="Review release",
+                    agent_name="reviewer",
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("AGENT_TOOL_UNAVAILABLE", result["error"])
+        build.assert_not_called()
+
+    def test_batch_route_preflight_builds_no_partial_children(self):
+        parent = _make_mock_parent(depth=0)
+        first = MagicMock(name="first")
+        first.name = "first"
+        first.provider = "provider-a"
+        first.model = "model-a"
+        first.tools_allow = None
+        first.mcp_allow = None
+        second = MagicMock(name="second")
+        second.name = "second"
+        second.provider = "provider-b"
+        second.model = "model-b"
+        second.tools_allow = None
+        second.mcp_allow = None
+
+        with (
+            patch(
+                "tools.delegate_tool._resolve_selected_agent",
+                side_effect=[first, second],
+            ),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                side_effect=[
+                    {"provider": None, "model": None, "base_url": None, "api_key": None, "api_mode": None},
+                    {"provider": "provider-a", "model": "model-a", "base_url": "a", "api_key": "a", "api_mode": None},
+                    ValueError("missing credential"),
+                ],
+            ),
+            patch("tools.delegate_tool._build_child_preserving_parent_tools") as build,
+        ):
+            result = json.loads(
+                delegate_task(
+                    tasks=[
+                        {"goal": "First", "agent_name": "first"},
+                        {"goal": "Second", "agent_name": "second"},
+                    ],
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("AGENT_ROUTE_UNAVAILABLE", result["error"])
+        build.assert_not_called()
 
     def test_dispatch_forwards_agent_name(self):
         from run_agent import AIAgent

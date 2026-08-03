@@ -506,6 +506,22 @@ class CLICommandsMixin:
                 _cprint(f"  {definition.description}")
                 _cprint(f"  Source: {definition.relative_path}")
                 _cprint(f"  Digest: {definition.full_digest}")
+                _cprint(
+                    "  Tools: "
+                    + (
+                        "inherit"
+                        if definition.tools_allow is None
+                        else ", ".join(definition.tools_allow) or "none"
+                    )
+                )
+                _cprint(
+                    "  MCP: "
+                    + (
+                        "inherit"
+                        if definition.mcp_allow is None
+                        else ", ".join(definition.mcp_allow) or "none"
+                    )
+                )
                 return
             _cprint("  Usage: /agents [definitions|show <name>]")
             return

@@ -306,6 +306,12 @@ def _tool_search_scoped_names(agent) -> frozenset:
     except Exception:
         return frozenset()
 
+    exact_allowlist = getattr(agent, "_exact_tool_allowlist", None)
+    if exact_allowlist is not None:
+        return frozenset(
+            name for name in exact_allowlist if _ts.is_deferrable_tool_name(name)
+        )
+
     enabled = getattr(agent, "enabled_toolsets", None)
     disabled = getattr(agent, "disabled_toolsets", None)
     cache_key = (
@@ -1811,8 +1817,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         or "",
                         enabled_tools=(
                             list(agent.valid_tool_names)
-                            if agent.valid_tool_names
-                            else None
+                        ),
+                        authorized_mcp_owners=dict(
+                            getattr(agent, "_exact_mcp_tool_owners", {}) or {}
                         ),
                         skip_pre_tool_call_hook=True,
                         skip_tool_request_middleware=True,
@@ -1890,8 +1897,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         or "",
                         enabled_tools=(
                             list(agent.valid_tool_names)
-                            if agent.valid_tool_names
-                            else None
+                        ),
+                        authorized_mcp_owners=dict(
+                            getattr(agent, "_exact_mcp_tool_owners", {}) or {}
                         ),
                         skip_pre_tool_call_hook=True,
                         skip_tool_request_middleware=True,
