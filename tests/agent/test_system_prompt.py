@@ -10,6 +10,7 @@ from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 def _make_agent(**overrides):
     base = dict(
+        identity_override=None,
         load_soul_identity=False,
         skip_context_files=False,
         valid_tool_names=[],
@@ -70,6 +71,34 @@ def _stable_prompt(agent):
         patch("run_agent.build_context_files_prompt", return_value=""),
     ):
         return build_system_prompt_parts(agent)["stable"]
+
+
+def test_replace_identity_is_the_first_stable_prompt_part():
+    agent = _make_agent(identity_override="You are the release verifier.")
+    with (
+        patch("run_agent.load_soul_md", return_value="PROFILE SOUL") as load_soul,
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        stable = build_system_prompt_parts(agent)["stable"]
+
+    assert stable.startswith("You are the release verifier.\n\n")
+    assert "PROFILE SOUL" not in stable
+    load_soul.assert_not_called()
+
+
+def test_profile_identity_still_loads_soul_without_override():
+    agent = _make_agent(load_soul_identity=True)
+    with (
+        patch("run_agent.load_soul_md", return_value="PROFILE SOUL"),
+        patch("run_agent.build_nous_subscription_prompt", return_value=""),
+        patch("run_agent.build_environment_hints", return_value=""),
+        patch("run_agent.build_context_files_prompt", return_value=""),
+    ):
+        stable = build_system_prompt_parts(agent)["stable"]
+
+    assert stable.startswith("PROFILE SOUL\n\n")
 
 
 def _prompt_parts(agent):

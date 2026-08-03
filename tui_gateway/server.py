@@ -3783,6 +3783,19 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     elif service_tier:
         overrides["service_tier_override"] = service_tier
 
+    catalog_snapshot = model_config.get("agent_catalog")
+    if catalog_snapshot is not None:
+        try:
+            from agent.agent_definitions import restore_agent_catalog
+            from hermes_constants import get_hermes_home
+
+            overrides["agent_catalog"] = restore_agent_catalog(
+                catalog_snapshot,
+                get_hermes_home(),
+            )
+        except Exception as exc:
+            raise ValueError(f"stored agent catalog is invalid: {exc}") from exc
+
     return overrides
 
 
@@ -6439,6 +6452,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    agent_catalog=None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -6613,6 +6627,7 @@ def _make_agent(
         skip_context_files=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
+        agent_catalog=agent_catalog,
         **_agent_cbs(sid),
     )
 

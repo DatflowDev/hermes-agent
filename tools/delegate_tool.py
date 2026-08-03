@@ -897,6 +897,33 @@ def check_delegate_requirements() -> bool:
     return True
 
 
+def _resolve_selected_agent(parent_agent, agent_name: Optional[str]):
+    """Resolve and securely reload a conversation-pinned agent definition."""
+    if not agent_name:
+        return None
+    from agent.agent_definitions import AgentDefinitionError, reload_catalog_entry
+
+    if not isinstance(agent_name, str):
+        raise AgentDefinitionError(
+            "AGENT_DEFINITION_NOT_FOUND",
+            "agent definition name must be a string",
+        )
+
+    catalog = getattr(parent_agent, "_agent_catalog", None)
+    if catalog is None:
+        raise AgentDefinitionError(
+            "AGENT_CATALOG_UNAVAILABLE",
+            "agent definitions are unavailable for this conversation",
+        )
+    entry = catalog.get(agent_name)
+    if entry is None:
+        raise AgentDefinitionError(
+            "AGENT_DEFINITION_NOT_FOUND",
+            f"unknown agent definition: {agent_name}",
+        )
+    return reload_catalog_entry(entry)
+
+
 def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
@@ -915,7 +942,7 @@ def _build_child_system_prompt(
     the LLM doesn't confabulate nesting capabilities that don't exist.
     """
     parts = [
-        "You are a focused subagent working on a specific delegated task.",
+        "This is a delegated child task.",
         "",
         f"YOUR TASK:\n{goal}",
     ]
@@ -1321,6 +1348,7 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    agent_definition=None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1572,6 +1600,11 @@ def _build_child_agent(
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    if agent_definition is not None and agent_definition.fallbacks is not None:
+        parent_fallback = [
+            {"provider": route.provider, "model": route.model}
+            for route in agent_definition.fallbacks
+        ]
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1634,6 +1667,15 @@ def _build_child_agent(
             log_prefix=f"[subagent-{task_index}]",
             platform="subagent",
             skip_context_files=True,
+            load_soul_identity=(
+                agent_definition is None or agent_definition.identity == "profile"
+            ),
+            identity_override=(
+                agent_definition.instructions
+                if agent_definition is not None and agent_definition.identity == "replace"
+                else None
+            ),
+            agent_catalog=getattr(parent_agent, "_agent_catalog", None),
             skip_memory=True,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
@@ -1669,6 +1711,23 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._agent_definition_metadata = (
+        {
+            "name": agent_definition.name,
+            "digest": agent_definition.full_digest,
+            "identity": agent_definition.identity,
+        }
+        if agent_definition is not None
+        else None
+    )
+    # Profile-mode definition guidance belongs to the cached system-message
+    # tier, not the ephemeral task framing. _run_single_child threads this
+    # immutable value through every prompt rebuild.
+    child._agent_definition_system_message = (
+        agent_definition.instructions
+        if agent_definition is not None and agent_definition.identity == "profile"
+        else None
+    )
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2325,11 +2384,17 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
+                run_kwargs = {
+                    "user_message": goal,
+                    "task_id": child_task_id,
+                    "stream_callback": _relay_child_text,
+                }
+                definition_message = getattr(
+                    child, "_agent_definition_system_message", None
                 )
+                if definition_message is not None:
+                    run_kwargs["system_message"] = definition_message
+                return child.run_conversation(**run_kwargs)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -3123,6 +3188,7 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
+    agent_name: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
@@ -3226,7 +3292,12 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        single_task: Dict[str, Any] = {"goal": goal, "context": context, "role": top_role}
+        single_task: Dict[str, Any] = {
+            "goal": goal,
+            "context": context,
+            "agent_name": agent_name,
+            "role": top_role,
+        }
         if output_schema is not None:
             single_task["output_schema"] = output_schema
         task_list = [single_task]
@@ -3272,6 +3343,17 @@ def delegate_task(
             return tool_error(f"Task {i} output_schema invalid: {schema_err}")
         task_schemas.append(coerced_schema)
 
+    # Resolve/reload all selections before any child is built. A stale or
+    # invalid definition aborts the whole batch atomically.
+    try:
+        selected_definitions = [
+            _resolve_selected_agent(parent_agent, task.get("agent_name"))
+            for task in task_list
+        ]
+    except ValueError as exc:
+        code = getattr(exc, "code", "AGENT_DEFINITION_INVALID")
+        return tool_error(f"{code}: {exc}")
+
     overall_start = time.monotonic()
     results = []
 
@@ -3315,7 +3397,7 @@ def delegate_task(
         _capture_gateway_steer_authority(_origin_ui_session_id)
     )
 
-    # Build all child agents on the main thread (thread-safe construction).
+    # Resolve every route b...[truncated]
     # _build_child_preserving_parent_tools saves/restores the parent's
     # resolved tool names around each construction under a lock, so child
     # toolset resolution never leaks into the parent (shared with the plugin
@@ -3333,6 +3415,23 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        definition = selected_definitions[i]
+        definition_creds = creds
+        if definition is not None and (definition.provider or definition.model):
+            route_cfg = dict(cfg)
+            route_cfg.pop("base_url", None)
+            route_cfg.pop("api_key", None)
+            route_cfg.pop("api_mode", None)
+            route_cfg["provider"] = definition.provider or ""
+            route_cfg["model"] = definition.model or ""
+            try:
+                definition_creds = _resolve_delegation_credentials(
+                    route_cfg, parent_agent
+                )
+            except ValueError as exc:
+                return tool_error(
+                    f"AGENT_ROUTE_UNAVAILABLE ({definition.name}): {exc}"
+                )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3340,18 +3439,23 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
-            model=creds["model"],
+            model=(
+                definition.model
+                if definition is not None and definition.model
+                else definition_creds["model"]
+            ),
             max_iterations=effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
+            override_provider=definition_creds["provider"],
+            override_base_url=definition_creds["base_url"],
+            override_api_key=definition_creds["api_key"],
+            override_api_mode=definition_creds["api_mode"],
+            override_request_overrides=definition_creds.get("request_overrides"),
+            override_max_tokens=definition_creds.get("max_output_tokens"),
+            override_acp_command=definition_creds.get("command"),
+            override_acp_args=definition_creds.get("args"),
+            agent_definition=definition,
             role=effective_role,
         )
         # Attach the validated schema for the completion-side validation
@@ -4217,6 +4321,14 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "agent_name": {
+                "type": "string",
+                "description": (
+                    "Optional canonical name of a profile-defined agent. "
+                    "When definitions are available, the runtime projects a "
+                    "bounded enum and catalog description here."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4226,6 +4338,10 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "agent_name": {
+                            "type": "string",
+                            "description": "Per-task profile-defined agent name.",
                         },
                         "role": {
                             "type": "string",
@@ -4334,6 +4450,7 @@ registry.register(
     handler=lambda args, **kw: delegate_task(
         goal=args.get("goal"),
         context=args.get("context"),
+        agent_name=args.get("agent_name"),
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
