@@ -1242,6 +1242,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    exact_tool_allowlist: Optional[set[str]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1254,6 +1255,24 @@ def _build_child_agent(
     """
     from run_agent import AIAgent
     import uuid as _uuid
+
+    # Exact authority is transitive. A restricted orchestrator that delegates
+    # without selecting another restricted definition must not fall back to
+    # rebuilding authority from its broader inherited toolsets. Keep this
+    # defensive inheritance here as the common child-construction boundary;
+    # callers may further narrow it, but ``None`` never widens a restricted
+    # parent.
+    if exact_tool_allowlist is None:
+        inherited_exact = getattr(parent_agent, "_exact_tool_allowlist", None)
+        if inherited_exact is None:
+            inherited_exact = getattr(parent_agent, "_raw_authorized_tool_names", None)
+        if inherited_exact is None:
+            inherited_exact = getattr(parent_agent, "valid_tool_names", None)
+        if inherited_exact is not None:
+            exact_tool_allowlist = set(inherited_exact)
+    parent_mcp_owners = dict(
+        getattr(parent_agent, "_exact_mcp_tool_owners", {}) or {}
+    )
 
     # ── Role resolution ─────────────────────────────────────────────────
     # Honor the caller's role only when BOTH the kill switch and the
@@ -1586,6 +1605,71 @@ def _build_child_agent(
             iteration_budget=None,  # fresh budget per subagent
             **child_optional_kwargs,
         )
+    if exact_tool_allowlist is not None:
+        import model_tools
+        from tools.tool_search import assemble_tool_defs
+
+        # Apply role denials directly to the exact inherited authority. Never
+        # map names back through a toolset here: doing so can restore siblings.
+        role_denied = set(DELEGATE_BLOCKED_TOOLS)
+        if effective_role == "orchestrator":
+            role_denied.discard("delegate_task")
+        requested = set(exact_tool_allowlist) - role_denied - {"kanban"}
+        # Rebuild from the child's pre-deferred registry projection. Filtering
+        # child.tools directly is insufficient because it may already contain
+        # only tool_search/tool_call bridges rather than the underlying MCP or
+        # plugin schemas. Preserve any post-build injected schemas as well.
+        candidate_defs = list(
+            model_tools.get_tool_definitions(
+                enabled_toolsets=child_toolsets,
+                disabled_toolsets=child_disabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            or []
+        )
+        candidate_defs.extend(
+            tool
+            for tool in child.tools
+            if (tool.get("function") or {}).get("name")
+            not in {"tool_search", "tool_describe", "tool_call"}
+        )
+        by_name = {
+            name: tool
+            for tool in candidate_defs
+            if isinstance(name := (tool.get("function") or {}).get("name"), str)
+        }
+        from tools.mcp_tool import get_mcp_server_for_tool
+
+        allowed_names = requested & set(by_name)
+        allowed_names = {
+            name
+            for name in allowed_names
+            if (
+                name not in parent_mcp_owners
+                or get_mcp_server_for_tool(name) == parent_mcp_owners[name]
+            )
+        }
+        allowed = frozenset(allowed_names)
+        raw_defs = [by_name[name] for name in sorted(allowed)]
+        child.tools = assemble_tool_defs(raw_defs).tool_defs
+        visible_names = {
+            name
+            for tool in child.tools
+            if (name := (tool.get("function") or {}).get("name"))
+        }
+        # Execution authority includes deferred names hidden behind tool_call;
+        # the model-facing schema remains child.tools (bridges only).
+        child.valid_tool_names = visible_names | allowed
+        child._raw_authorized_tool_names = set(allowed)
+        child._exact_tool_allowlist = allowed
+        child._exact_mcp_tool_owners = {}
+        for name in allowed:
+            current_owner = get_mcp_server_for_tool(name)
+            expected_owner = parent_mcp_owners.get(name, current_owner)
+            if expected_owner is not None:
+                child._exact_mcp_tool_owners[name] = expected_owner
+        child._tool_search_scope_cache = None
     child._print_fn = getattr(parent_agent, "_print_fn", None)
     # Now the child exists, its session id can ride on every relayed event
     # (including the spawn_requested below — first emit happens after this).
@@ -3013,15 +3097,11 @@ def delegate_task(
 
     _origin_wake_sid = _current_origin_session_id()
 
-    # Resolve every route b...[truncated]
-    # _build_child_preserving_parent_tools saves/restores the parent's
-    # resolved tool names around each construction under a lock, so child
-    # toolset resolution never leaks into the parent (shared with the plugin
-    # subagent-lifecycle API).
-    children = []
+    # Resolve every route and exact authority before constructing the first
+    # child. A later invalid task must not leave partially initialized clients,
+    # sessions, MCP state, or tool registries from earlier tasks.
+    launch_plans = []
     for i, t in enumerate(task_list):
-        # Per-task role beats top-level; normalise again so unknown
-        # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
         definition = selected_definitions[i]
         definition_creds = creds
@@ -3040,6 +3120,82 @@ def delegate_task(
                 return tool_error(
                     f"AGENT_ROUTE_UNAVAILABLE ({definition.name}): {exc}"
                 )
+        inherited_exact = getattr(parent_agent, "_exact_tool_allowlist", None)
+        if inherited_exact is None:
+            inherited_exact = getattr(parent_agent, "_raw_authorized_tool_names", None)
+        if inherited_exact is None:
+            inherited_exact = getattr(parent_agent, "valid_tool_names", None)
+        exact_tool_allowlist = (
+            set(inherited_exact) if inherited_exact is not None else None
+        )
+        if definition is not None and (
+            definition.tools_allow is not None or definition.mcp_allow is not None
+        ):
+            if inherited_exact is not None:
+                parent_names = set(inherited_exact)
+            else:
+                parent_names = set(
+                    getattr(parent_agent, "_raw_authorized_tool_names", ()) or ()
+                )
+                if not parent_names:
+                    # Compatibility for agents built before raw authority was
+                    # captured. This may omit deferred tools, but never widens.
+                    parent_names = set(
+                        getattr(parent_agent, "valid_tool_names", ()) or ()
+                    )
+            from tools.mcp_tool import get_mcp_server_for_tool
+
+            parent_mcp = {
+                name for name in parent_names if get_mcp_server_for_tool(name) is not None
+            }
+            parent_non_mcp = parent_names - parent_mcp
+
+            if definition.tools_allow is None:
+                direct_names = parent_non_mcp
+            else:
+                requested_tools = set(definition.tools_allow)
+                unavailable_tools = requested_tools - parent_non_mcp
+                if unavailable_tools:
+                    return tool_error(
+                        "AGENT_TOOL_UNAVAILABLE "
+                        f"({definition.name}): {sorted(unavailable_tools)[0]}"
+                    )
+                direct_names = parent_non_mcp & requested_tools
+
+            if definition.mcp_allow is None:
+                mcp_names = parent_mcp
+            else:
+                allowed_servers = set(definition.mcp_allow)
+                parent_servers = {
+                    server
+                    for name in parent_mcp
+                    if (server := get_mcp_server_for_tool(name)) is not None
+                }
+                unavailable_servers = allowed_servers - parent_servers
+                if unavailable_servers:
+                    return tool_error(
+                        "AGENT_MCP_UNAVAILABLE "
+                        f"({definition.name}): {sorted(unavailable_servers)[0]}"
+                    )
+                mcp_names = {
+                    name
+                    for name in parent_mcp
+                    if get_mcp_server_for_tool(name) in allowed_servers
+                }
+            exact_tool_allowlist = direct_names | mcp_names
+        launch_plans.append(
+            (effective_role, definition, definition_creds, exact_tool_allowlist)
+        )
+
+    # _build_child_preserving_parent_tools saves/restores the parent's
+    # resolved tool names around each construction under a lock, so child
+    # toolset resolution never leaks into the parent (shared with the plugin
+    # subagent-lifecycle API).
+    children = []
+    for i, t in enumerate(task_list):
+        effective_role, definition, definition_creds, exact_tool_allowlist = (
+            launch_plans[i]
+        )
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3065,6 +3221,7 @@ def delegate_task(
             override_acp_args=definition_creds.get("args"),
             agent_definition=definition,
             role=effective_role,
+            exact_tool_allowlist=exact_tool_allowlist,
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract

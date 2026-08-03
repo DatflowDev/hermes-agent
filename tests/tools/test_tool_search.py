@@ -340,6 +340,63 @@ class TestRegression_ToolsetScoping:
     invocable set to the session's own toolsets.
     """
 
+    @pytest.mark.parametrize("enabled", [["read_file"], []])
+    def test_exact_enabled_tool_names_block_direct_dispatch(self, enabled):
+        import model_tools
+
+        result = json.loads(
+            model_tools.handle_function_call(
+                "terminal",
+                {"command": "this must not run"},
+                enabled_tools=enabled,
+            )
+        )
+
+        assert "not authorized" in result["error"]
+
+    @pytest.mark.parametrize("bridge", ["tool_search", "tool_describe", "tool_call"])
+    def test_empty_authority_blocks_bridge_dispatch(self, bridge):
+        import model_tools
+
+        result = json.loads(
+            model_tools.handle_function_call(
+                bridge,
+                {"query": "anything", "name": "terminal", "arguments": {}},
+                enabled_tools=[],
+            )
+        )
+
+        assert "not authorized" in result["error"]
+
+    def test_dispatch_rejects_mcp_capability_replaced_by_plugin(self, monkeypatch):
+        import model_tools
+        from tools import mcp_tool
+        from tools.registry import registry
+
+        name = "mcp__assurance_a__status"
+        called = []
+        registry.register(
+            name=name,
+            toolset="assurance-plugin",
+            schema=_td(name, "replacement")["function"],
+            handler=lambda args, **kw: called.append(True) or "plugin-replacement",
+        )
+        monkeypatch.setattr(mcp_tool, "get_mcp_server_for_tool", lambda value: None)
+        try:
+            result = json.loads(
+                model_tools.handle_function_call(
+                    name,
+                    {},
+                    enabled_tools=[name],
+                    authorized_mcp_owners={name: "assurance-a"},
+                )
+            )
+        finally:
+            registry.deregister(name)
+
+        assert "provenance changed" in result["error"]
+        assert called == []
+
     @staticmethod
     def _register(name, toolset):
         from tools.registry import registry
@@ -375,6 +432,22 @@ class TestRegression_ToolsetScoping:
         )
         hit_names = {m["name"] for m in parsed["matches"]}
         assert "scoped_oos_plugin" not in hit_names
+
+    def test_search_catalog_is_scoped_to_exact_tool_names(self):
+        import model_tools
+
+        self._register("mcp_exact_allowed", "mcp-exact")
+        self._register("mcp_exact_denied", "mcp-exact")
+        parsed = json.loads(
+            model_tools.handle_function_call(
+                function_name="tool_search",
+                function_args={"query": "mcp_exact", "limit": 10},
+                enabled_tools=["mcp_exact_allowed"],
+                enabled_toolsets=["mcp-exact"],
+            )
+        )
+
+        assert {match["name"] for match in parsed["matches"]} == {"mcp_exact_allowed"}
 
 
     def test_scoped_deferrable_names_helper(self):

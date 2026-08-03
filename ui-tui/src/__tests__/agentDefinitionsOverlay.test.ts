@@ -10,6 +10,8 @@ const definition: AgentDefinitionProjection = {
   fallback_count: 0,
   identity: 'replace',
   model: null,
+  tools_allow: ['read_file'],
+  mcp_allow: [],
   name: 'reviewer',
   provider: null,
   relative_path: 'reviewer.md'

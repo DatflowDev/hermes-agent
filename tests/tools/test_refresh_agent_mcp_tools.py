@@ -44,6 +44,56 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_cannot_expand_an_exact_agent_allowlist(monkeypatch):
+    agent = _agent(["read_file"])
+    agent._exact_tool_allowlist = frozenset({"read_file"})
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("read_file"), _tool("mcp_new_server_tool"), _tool("terminal")],
+    )
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.valid_tool_names == {"read_file"}
+    assert [tool["function"]["name"] for tool in agent.tools] == ["read_file"]
+
+
+def test_refresh_revokes_mcp_name_reowned_by_another_raw_server(monkeypatch):
+    agent = _agent(["mcp_team_a_status"])
+    agent._exact_tool_allowlist = frozenset({"mcp_team_a_status"})
+    agent._exact_mcp_tool_owners = {"mcp_team_a_status": "team-a"}
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: [_tool("mcp_team_a_status")],
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "get_mcp_server_for_tool",
+        lambda name: "team_a" if name == "mcp_team_a_status" else None,
+    )
+
+    assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+
+
+def test_mcp_normalized_name_cannot_change_raw_owner(monkeypatch):
+    tool_name = "mcp__team_a__status"
+    monkeypatch.setitem(mcp_tool._mcp_tool_server_history, tool_name, "team-a")
+
+    assert mcp_tool._mcp_tool_owner_conflicts(tool_name, "team_a") is True
+    assert mcp_tool._mcp_tool_owner_conflicts(tool_name, "team-a") is False
+
+
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
     """B1 regression: a rebuild must NOT drop post-build-injected tools.
 

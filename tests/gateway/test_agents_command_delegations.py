@@ -43,6 +43,37 @@ def _make_runner():
 class _Event:
     source = None
 
+    def __init__(self, args=""):
+        self._args = args
+
+    def get_command_args(self):
+        return self._args
+
+
+@pytest.mark.asyncio
+async def test_agents_definitions_uses_conversation_pinned_catalog(tmp_path):
+    from agent.agent_definitions import discover_profile_agents
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "reviewer.md").write_text(
+        "---\nname: reviewer\ndescription: Review evidence\nidentity: replace\n"
+        "tools:\n  allow: [read_file]\nmcp:\n  allow: []\n---\nReview.\n"
+    )
+    catalog = discover_profile_agents(tmp_path)
+    runner = _make_runner()
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {
+        "agent:main:test:dm:1": (type("Agent", (), {"_agent_catalog": catalog})(), 0)
+    }
+
+    listed = await runner._handle_agents_command(_Event("definitions"))
+    shown = await runner._handle_agents_command(_Event("show reviewer"))
+
+    assert "Review evidence" in listed
+    assert "Tools: read_file" in shown
+    assert "MCP: none" in shown
+
 
 @pytest.mark.asyncio
 async def test_agents_command_marks_stalling_delegation(monkeypatch):

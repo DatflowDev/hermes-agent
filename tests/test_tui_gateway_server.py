@@ -1123,7 +1123,7 @@ def test_agent_definitions_rpc_returns_allowlisted_projection(monkeypatch, tmp_p
 
     assert response is not None
     payload = response["result"]
-    assert payload["version"] == 1
+    assert payload["version"] == 2
     assert payload["definitions"] == [
         {
             "definition_id": payload["definitions"][0]["definition_id"],
@@ -1133,6 +1133,8 @@ def test_agent_definitions_rpc_returns_allowlisted_projection(monkeypatch, tmp_p
             "provider": "provider-a",
             "model": "model-a",
             "fallback_count": 1,
+            "tools_allow": None,
+            "mcp_allow": None,
             "relative_path": "researcher.md",
             "digest": payload["definitions"][0]["digest"],
         }
@@ -1203,6 +1205,146 @@ def test_agent_definition_launch_is_bound_and_single_use(monkeypatch, tmp_path):
     assert second is not None
     assert first["result"]["definition_name"] == "reviewer"
     assert second["error"]["code"] == 4091
+
+
+def test_agent_definition_launch_replay_is_rejected_after_agent_reconstruction(
+    monkeypatch, tmp_path
+):
+    import threading
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from agent.agent_definitions import discover_profile_agents
+    from tui_gateway import server
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "reviewer.md").write_text(
+        "---\nname: reviewer\ndescription: Review\nidentity: replace\n---\nReview carefully.\n"
+    )
+    catalog = discover_profile_agents(tmp_path)
+
+    def fresh_agent():
+        return SimpleNamespace(
+            _agent_catalog=catalog,
+            _agent_launch_request_ids=OrderedDict(),
+            _agent_launch_request_lock=threading.Lock(),
+        )
+
+    monkeypatch.setitem(
+        server._sessions,
+        "durable-launch-session",
+        {"agent": fresh_agent(), "profile_home": str(tmp_path)},
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    calls = []
+    monkeypatch.setattr(
+        "tools.delegate_tool.delegate_task",
+        lambda **kwargs: calls.append(kwargs) or '{"status":"dispatched"}',
+    )
+    entry = catalog.entries[0]
+    request = {
+        "jsonrpc": "2.0",
+        "method": "agent_definitions.launch",
+        "params": {
+            "session_id": "durable-launch-session",
+            "definition_id": entry.definition_id,
+            "digest": entry.definition.full_digest,
+            "revision": catalog.revision,
+            "request_id": "durable-request",
+            "task": "Review",
+        },
+    }
+
+    first = server.handle_request({**request, "id": "first"})
+    server._sessions["durable-launch-session"]["agent"] = fresh_agent()
+    second = server.handle_request({**request, "id": "second"})
+
+    assert first is not None and "result" in first
+    assert second is not None and second["error"]["code"] == 4091
+    assert len(calls) == 1
+
+
+def test_agent_definition_launch_request_id_cannot_rebind_after_catalog_change(tmp_path):
+    from tui_gateway.methods_tools import _reserve_agent_launch
+
+    assert _reserve_agent_launch(
+        tmp_path,
+        "durable-session",
+        "definition-a",
+        "a" * 64,
+        "revision-a",
+        "same-request",
+    )
+    assert not _reserve_agent_launch(
+        tmp_path,
+        "durable-session",
+        "definition-b",
+        "b" * 64,
+        "revision-b",
+        "same-request",
+    )
+
+
+def test_agent_definition_launch_binds_session_profile_home_and_secret_scope(monkeypatch, tmp_path):
+    import threading
+    from collections import OrderedDict
+    from types import SimpleNamespace
+
+    from agent.agent_definitions import discover_profile_agents
+    from agent.secret_scope import current_secret_scope
+    from hermes_constants import get_hermes_home
+    from tui_gateway import server
+
+    profile_home = tmp_path / "profiles" / "target"
+    agents = profile_home / "agents"
+    agents.mkdir(parents=True)
+    (profile_home / ".env").write_text("PROFILE_ONLY_TEST_SECRET=target-value\n")
+    (agents / "reviewer.md").write_text(
+        "---\nname: reviewer\ndescription: Review\nidentity: replace\n---\nReview carefully.\n"
+    )
+    catalog = discover_profile_agents(profile_home)
+    agent = SimpleNamespace(
+        _agent_catalog=catalog,
+        _agent_launch_request_ids=OrderedDict(),
+        _agent_launch_request_lock=threading.Lock(),
+    )
+    monkeypatch.setitem(
+        server._sessions,
+        "profile-launch-session",
+        {"agent": agent, "profile_home": str(profile_home)},
+    )
+    monkeypatch.setattr(server, "_start_agent_build", lambda *_args: None)
+    monkeypatch.setattr(server, "_wait_agent", lambda *_args: None)
+    seen = {}
+
+    def delegate(**_kwargs):
+        seen["home"] = get_hermes_home()
+        seen["scope"] = current_secret_scope()
+        return '{"status":"dispatched"}'
+
+    monkeypatch.setattr("tools.delegate_tool.delegate_task", delegate)
+    entry = catalog.entries[0]
+    response = server.handle_request(
+        {
+            "jsonrpc": "2.0",
+            "id": "profile-launch",
+            "method": "agent_definitions.launch",
+            "params": {
+                "session_id": "profile-launch-session",
+                "definition_id": entry.definition_id,
+                "digest": entry.definition.full_digest,
+                "revision": catalog.revision,
+                "request_id": "profile-request",
+                "task": "Review",
+            },
+        }
+    )
+
+    assert response is not None and "result" in response
+    assert seen["home"] == profile_home
+    assert seen["scope"]["PROFILE_ONLY_TEST_SECRET"] == "target-value"
 
 
 def test_agent_definition_launch_propagates_delegate_error(monkeypatch, tmp_path):

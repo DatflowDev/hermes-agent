@@ -1087,10 +1087,11 @@ def _execute_remote(
     timeout = _cfg.get("timeout", DEFAULT_TIMEOUT)
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    sandbox_tools = (
+        SANDBOX_ALLOWED_TOOLS
+        if enabled_tools is None
+        else frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    )
 
     effective_task_id = task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
@@ -1341,11 +1342,14 @@ def execute_code(
     max_tool_calls = _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
 
     # Determine which tools the sandbox can call
-    session_tools = set(enabled_tools) if enabled_tools else set()
-    sandbox_tools = frozenset(SANDBOX_ALLOWED_TOOLS & session_tools)
-
-    if not sandbox_tools:
-        sandbox_tools = SANDBOX_ALLOWED_TOOLS
+    # ``None`` preserves legacy unrestricted callers. An explicit empty or
+    # non-overlapping set is authoritative and must never widen to every RPC
+    # stub — that would turn a narrow agent allowlist into full sandbox access.
+    sandbox_tools = (
+        SANDBOX_ALLOWED_TOOLS
+        if enabled_tools is None
+        else frozenset(SANDBOX_ALLOWED_TOOLS & set(enabled_tools))
+    )
 
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
