@@ -1617,6 +1617,104 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5033, str(e))
 
 
+@method("agent_definitions.list")
+def _(rid, params: dict) -> dict:
+    """Return the conversation-pinned allowlisted agent catalog projection."""
+    try:
+        session, err = _sess(params, rid)
+        if err:
+            return err
+        agent = session.get("agent")
+        if agent is None:
+            return _err(rid, 4001, "session agent unavailable")
+        catalog = getattr(agent, "_agent_catalog", None)
+        if catalog is None:
+            return _err(rid, 4001, "session agent catalog unavailable")
+        return _ok(rid, catalog.project())
+    except Exception as exc:
+        code = getattr(exc, "code", "AGENT_DEFINITION_INVALID")
+        return _err(rid, 5034, f"{code}: {exc}")
+
+
+@method("agent_definitions.launch")
+def _(rid, params: dict) -> dict:
+    """Launch one exact pinned definition through the native delegation runtime."""
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    agent = session.get("agent")
+    if agent is None:
+        return _err(rid, 4001, "session agent unavailable")
+
+    definition_id = str(params.get("definition_id") or "")
+    digest = str(params.get("digest") or "")
+    revision = str(params.get("revision") or "")
+    request_id = str(params.get("request_id") or "")
+    task = str(params.get("task") or "").strip()
+    if not all((definition_id, digest, revision, request_id, task)):
+        return _err(rid, 4000, "definition_id, digest, revision, request_id and task are required")
+    if len(request_id) > 128 or len(task) > 20_000:
+        return _err(rid, 4000, "launch request exceeds its limit")
+
+    catalog = getattr(agent, "_agent_catalog", None)
+    if catalog is None or catalog.revision != revision:
+        return _err(rid, 4090, "STALE_AGENT_DEFINITION: catalog revision changed")
+    entry = catalog.get_by_id(definition_id)
+    if entry is None or entry.definition.full_digest != digest:
+        return _err(rid, 4090, "STALE_AGENT_DEFINITION: definition identity changed")
+
+    import time
+
+    launch_lock = getattr(agent, "_agent_launch_request_lock", None)
+    if launch_lock is None:
+        return _err(rid, 5000, "agent launch replay guard unavailable")
+    with launch_lock:
+        consumed = getattr(agent, "_agent_launch_request_ids", None)
+        if consumed is None or not hasattr(consumed, "move_to_end"):
+            return _err(rid, 5000, "agent launch replay cache unavailable")
+        now = time.monotonic()
+        while consumed:
+            oldest_id, oldest_at = next(iter(consumed.items()))
+            if len(consumed) <= 1024 and now - oldest_at <= 3600:
+                break
+            consumed.pop(oldest_id, None)
+        if request_id in consumed:
+            return _err(rid, 4091, "AGENT_LAUNCH_REPLAY: request_id already consumed")
+        consumed[request_id] = now
+
+    try:
+        import json
+        from tools.delegate_tool import delegate_task
+
+        result = json.loads(
+            delegate_task(
+                goal=task,
+                agent_name=entry.definition.name,
+                background=True,
+                parent_agent=agent,
+            )
+        )
+        if not isinstance(result, dict):
+            return _err(rid, 5000, "agent definition launch returned an invalid response")
+        if result.get("error"):
+            return _err(rid, 5000, f"agent definition launch failed: {result['error']}")
+        status = str(result.get("status") or "")
+        if status not in {"dispatched", "completed"}:
+            return _err(rid, 5000, f"agent definition launch failed with status: {status or 'unknown'}")
+        return _ok(
+            rid,
+            {
+                "status": status,
+                "definition_id": definition_id,
+                "definition_name": entry.definition.name,
+                "request_id": request_id,
+                "delegation": result,
+            },
+        )
+    except Exception as exc:
+        return _err(rid, 5000, f"agent definition launch failed: {exc}")
+
+
 @method("cron.manage")
 def _(rid, params: dict) -> dict:
     action, jid = params.get("action", "list"), params.get("name", "")

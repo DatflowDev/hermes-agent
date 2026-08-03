@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 from concurrent.futures.thread import _threads_queues
 
@@ -40,6 +41,33 @@ def test_idle_worker_reuse():
         assert tid1 == tid2
     finally:
         pool.shutdown(wait=True)
+
+
+def test_adjust_thread_count_supports_python_314_worker_context(monkeypatch):
+    """Python 3.14 removed _initializer/_initargs in favour of a worker context."""
+
+    captured = {}
+
+    def worker(executor_reference, context, work_queue):
+        captured["context"] = context
+        captured["queue"] = work_queue
+
+    monkeypatch.setattr("tools.daemon_pool._worker", worker)
+    monkeypatch.setattr("tools.daemon_pool.sys.version_info", (3, 14))
+    pool = DaemonThreadPoolExecutor(max_workers=1)
+    setattr(pool, "_create_worker_context", lambda: SimpleNamespace(marker="py314"))
+    if hasattr(pool, "_initializer"):
+        del pool._initializer
+    if hasattr(pool, "_initargs"):
+        del pool._initargs
+
+    pool._adjust_thread_count()
+    for thread in pool._threads:
+        thread.join(timeout=10)
+
+    assert captured["context"].marker == "py314"
+    assert captured["queue"] is pool._work_queue
+    pool.shutdown(wait=True)
 
 
 def test_wedged_worker_does_not_block_interpreter_exit():
