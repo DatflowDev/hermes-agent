@@ -46,6 +46,18 @@ def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
 
 
 class TestStoredPromptReuse:
+    def test_profile_definition_system_message_is_used_for_fresh_build(self):
+        agent = _make_agent()
+        agent._agent_definition_system_message = "Pinned profile guidance"
+
+        _restore_or_build_system_prompt(
+            agent,
+            agent._agent_definition_system_message,
+            [{"role": "user", "content": "hi"}],
+        )
+
+        agent._build_system_prompt.assert_called_once_with("Pinned profile guidance")
+
     def test_present_row_is_reused_verbatim(self, caplog):
         """Continuing session with a stored prompt → reuse byte-for-byte."""
         stored = "Stored prompt from turn 1 — byte-identical reuse"

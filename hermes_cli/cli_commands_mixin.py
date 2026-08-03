@@ -396,10 +396,45 @@ class CLICommandsMixin:
             stopped = interrupt_all(reason="/stop")
             print(f"  ✅ Interrupted {stopped} background delegation(s).")
 
-    def _handle_agents_command(self):
-        """Handle /agents — show background processes and agent status."""
+    def _handle_agents_command(self, command: str = "/agents"):
+        """Handle /agents — show runs or the pinned definition catalog."""
         from cli import _cprint
         from tools.process_registry import format_uptime_short, process_registry
+
+        parts = command.split(maxsplit=1)
+        subcommand = parts[1].strip() if len(parts) > 1 else ""
+        if subcommand:
+            catalog = getattr(getattr(self, "agent", None), "_agent_catalog", None)
+            if subcommand == "definitions":
+                entries = getattr(catalog, "entries", ()) if catalog is not None else ()
+                if not entries:
+                    _cprint("  No profile agent definitions.")
+                    return
+                _cprint(f"  Profile agent definitions ({len(entries)}):")
+                for entry in entries:
+                    definition = entry.definition
+                    route = " / ".join(
+                        value for value in (definition.provider, definition.model) if value
+                    ) or "inherits delegation route"
+                    _cprint(
+                        f"  - {definition.name} [{definition.identity}] — "
+                        f"{definition.description} · {route}"
+                    )
+                return
+            if subcommand.startswith("show "):
+                name = subcommand[5:].strip()
+                entry = catalog.get(name) if catalog is not None else None
+                if entry is None:
+                    _cprint(f"  Agent definition not found: {name}")
+                    return
+                definition = entry.definition
+                _cprint(f"  {definition.name} [{definition.identity}]")
+                _cprint(f"  {definition.description}")
+                _cprint(f"  Source: {definition.relative_path}")
+                _cprint(f"  Digest: {definition.full_digest}")
+                return
+            _cprint("  Usage: /agents [definitions|show <name>]")
+            return
 
         processes = process_registry.list_sessions()
         running = [p for p in processes if p.get("status") == "running"]

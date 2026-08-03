@@ -22,6 +22,8 @@ import {
 
 import { Panel, PanelEmpty, PanelHeader } from '../overlays/panel'
 
+import { AgentDefinitions } from './definitions'
+
 // Mirrors statusGlyph() in tool-fallback.tsx so subagent rows speak the
 // same visual vocabulary as the chat tool blocks.
 function statusGlyph(status: SubagentStatus, a: Translations['agents']): ReactNode {
@@ -85,16 +87,33 @@ export function AgentsView({ onClose }: AgentsViewProps) {
   // running in a background session must still be visible here, or the two
   // desync ("Agents N running" vs an empty tree).
   const tree = useMemo(() => buildSubagentTree(allSubagents(subagentsBySession)), [subagentsBySession])
+  const [tab, setTab] = useState<'runs' | 'definitions'>('runs')
 
   return (
     <Panel closeLabel={t.agents.close} onClose={onClose}>
-      {tree.length === 0 ? (
+      <PanelHeader subtitle={t.agents.subtitle} title={t.agents.title} />
+      <div aria-label="Agent views" className="flex gap-1 border-b border-border pb-2">
+        {(['runs', 'definitions'] as const).map(value => (
+          <button
+            aria-pressed={tab === value}
+            className={cn(
+              'rounded px-2.5 py-1 text-xs font-medium transition-colors',
+              tab === value ? 'bg-muted text-foreground' : 'text-muted-foreground hover:text-foreground'
+            )}
+            key={value}
+            onClick={() => setTab(value)}
+            type="button"
+          >
+            {value === 'runs' ? 'Runs' : 'Definitions'}
+          </button>
+        ))}
+      </div>
+      {tab === 'definitions' ? (
+        <AgentDefinitions />
+      ) : tree.length === 0 ? (
         <PanelEmpty description={t.agents.emptyDesc} icon="hubot" title={t.agents.emptyTitle} />
       ) : (
-        <>
-          <PanelHeader subtitle={t.agents.subtitle} title={t.agents.title} />
           <SubagentTree tree={tree} />
-        </>
       )}
     </Panel>
   )

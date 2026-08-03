@@ -186,11 +186,16 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
-    # Try SOUL.md as primary identity unless the caller explicitly skipped it.
+    # A file-defined replacement identity is pinned at child construction and
+    # occupies the same stable cache tier as SOUL.md.  It replaces only the
+    # persona; native Hermes guidance below remains unchanged.
+    _identity_override = getattr(agent, "identity_override", None)
     # Some execution modes (cron) still want HERMES_HOME persona while keeping
     # cwd project instructions disabled.
-    _soul_loaded = False
-    if agent.load_soul_identity or not agent.skip_context_files:
+    _soul_loaded = bool(_identity_override)
+    if _identity_override:
+        stable_parts.append(_identity_override)
+    elif agent.load_soul_identity or not agent.skip_context_files:
         _soul_content = _r.load_soul_md(_ctx_len)
         if _soul_content:
             stable_parts.append(_soul_content)
