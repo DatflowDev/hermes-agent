@@ -1036,6 +1036,10 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, sessionId,
                       {definition.fallback_count} fallback{definition.fallback_count === 1 ? '' : 's'} ·{' '}
                       {definition.relative_path}
                     </Text>
+                    <Text color={t.color.muted}>
+                      tools: {definition.tools_allow?.join(', ') ?? 'inherit'} · MCP:{' '}
+                      {definition.mcp_allow?.join(', ') ?? 'inherit'}
+                    </Text>
                   </Box>
                 )
               })

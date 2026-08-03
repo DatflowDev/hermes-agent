@@ -1134,6 +1134,7 @@ def handle_function_call(
     api_request_id: Optional[str] = None,
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
+    authorized_mcp_owners: Optional[Dict[str, str]] = None,
     skip_pre_tool_call_hook: bool = False,
     skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False,
@@ -1170,6 +1171,33 @@ def handle_function_call(
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+
+    # An explicit session tool-name set is an execution authority boundary,
+    # not only execute_code configuration. Empty means no tools are authorized.
+    if enabled_tools is not None:
+        allowed_names = set(enabled_tools)
+        bridge_names: set[str] = set()
+        try:
+            from tools.tool_search import BRIDGE_TOOL_NAMES
+
+            bridge_names = set(BRIDGE_TOOL_NAMES)
+        except Exception:
+            pass
+        bridge_authorized = function_name in bridge_names and bool(allowed_names)
+        if function_name not in allowed_names and not bridge_authorized:
+            return tool_error(f"Tool '{function_name}' is not authorized in this session")
+
+    # Exact MCP authority is a (registry name, raw server owner) capability,
+    # not a name-only capability. Reject substitution at the final dispatcher
+    # even before the next dynamic refresh.
+    if authorized_mcp_owners and function_name in authorized_mcp_owners:
+        from tools.mcp_tool import get_mcp_server_for_tool
+
+        expected_owner = authorized_mcp_owners[function_name]
+        if get_mcp_server_for_tool(function_name) != expected_owner:
+            return tool_error(
+                f"MCP tool '{function_name}' provenance changed; authorization revoked"
+            )
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
@@ -1219,6 +1247,13 @@ def handle_function_call(
                 disabled_toolsets=disabled_toolsets,
                 quiet_mode=True, skip_tool_search_assembly=True,
             ) or []
+            if enabled_tools is not None:
+                allowed_names = set(enabled_tools)
+                current_defs = [
+                    tool
+                    for tool in current_defs
+                    if (tool.get("function") or {}).get("name") in allowed_names
+                ]
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
@@ -1273,6 +1308,7 @@ def handle_function_call(
                 api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
+                authorized_mcp_owners=authorized_mcp_owners,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
                 skip_tool_request_middleware=skip_tool_request_middleware,
                 skip_tool_execution_middleware=skip_tool_execution_middleware,

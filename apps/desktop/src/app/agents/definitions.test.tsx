@@ -21,7 +21,7 @@ describe('AgentDefinitions', () => {
 
   it('renders the allowlisted catalog projection', async () => {
     requestGatewayMock.mockResolvedValue({
-      version: 1,
+      version: 2,
       revision: 'abc',
       definitions: [
         {
@@ -32,6 +32,8 @@ describe('AgentDefinitions', () => {
           provider: 'provider-a',
           model: 'model-a',
           fallback_count: 1,
+          tools_allow: ['web_search'],
+          mcp_allow: ['context7'],
           relative_path: 'research/researcher.md',
           digest: 'a'.repeat(64)
         }
@@ -43,12 +45,13 @@ describe('AgentDefinitions', () => {
     expect(await screen.findByText('researcher')).toBeTruthy()
     expect(screen.getByText('Verify sources')).toBeTruthy()
     expect(screen.getByText(/provider-a \/ model-a/)).toBeTruthy()
+    expect(screen.getByText(/tools: web_search · MCP: context7/)).toBeTruthy()
     expect(requestGatewayMock).toHaveBeenCalledWith('agent_definitions.list', { session_id: 'session-1' })
   })
 
   it('launches through the typed session-bound RPC', async () => {
     requestGatewayMock.mockResolvedValueOnce({
-      version: 1,
+      version: 2,
       revision: 'abc',
       definitions: [
         {
@@ -59,6 +62,8 @@ describe('AgentDefinitions', () => {
           provider: null,
           model: null,
           fallback_count: 0,
+          tools_allow: null,
+          mcp_allow: null,
           relative_path: 'researcher.md',
           digest: 'a'.repeat(64)
         }
@@ -85,7 +90,7 @@ describe('AgentDefinitions', () => {
   })
 
   it('renders the empty catalog state', async () => {
-    requestGatewayMock.mockResolvedValue({ version: 1, revision: 'empty', definitions: [] })
+    requestGatewayMock.mockResolvedValue({ version: 2, revision: 'empty', definitions: [] })
     render(<AgentDefinitions />)
 
     expect(await screen.findByText('No definitions')).toBeTruthy()
@@ -94,7 +99,7 @@ describe('AgentDefinitions', () => {
 
   it('announces launch failures as alerts', async () => {
     requestGatewayMock.mockResolvedValueOnce({
-      version: 1,
+      version: 2,
       revision: 'abc',
       definitions: [
         {
@@ -105,6 +110,8 @@ describe('AgentDefinitions', () => {
           provider: null,
           model: null,
           fallback_count: 0,
+          tools_allow: null,
+          mcp_allow: null,
           relative_path: 'researcher.md',
           digest: 'a'.repeat(64)
         }

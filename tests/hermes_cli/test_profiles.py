@@ -151,6 +151,14 @@ class TestCreateProfile:
         assert (profile_dir / ".env").read_text().strip() == "KEY=val"
         assert (profile_dir / "SOUL.md").read_text() == "Be helpful."
 
+    def test_clone_all_does_not_copy_agent_catalog_signing_key(self, profile_env):
+        default_home = profile_env / ".hermes"
+        (default_home / ".agent-catalog-signing-key").write_bytes(b"x" * 32)
+
+        profile_dir = create_profile("coder", clone_all=True, no_alias=True)
+
+        assert not (profile_dir / ".agent-catalog-signing-key").exists()
+
 
 
 
@@ -600,6 +608,10 @@ class TestExportImport:
         mem_dir = default_dir / "memories"
         mem_dir.mkdir(exist_ok=True)
         (mem_dir / "MEMORY.md").write_text("remember this")
+        agents_dir = default_dir / "agents"
+        agents_dir.mkdir(exist_ok=True)
+        (agents_dir / "reviewer.md").write_text("reviewer")
+        (default_dir / ".agent-catalog-signing-key").write_bytes(b"x" * 32)
 
         output = tmp_path / "export" / "default.tar.gz"
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -612,6 +624,24 @@ class TestExportImport:
         assert "default/.env" not in names  # credentials excluded
         assert "default/SOUL.md" in names
         assert "default/memories/MEMORY.md" in names
+        assert "default/agents/reviewer.md" in names
+        assert "default/.agent-catalog-signing-key" not in names
+
+    def test_named_export_and_import_preserve_agents_but_rotate_catalog_key(
+        self, profile_env, tmp_path
+    ):
+        source = create_profile("source", no_alias=True)
+        agents = source / "agents"
+        agents.mkdir(exist_ok=True)
+        (agents / "reviewer.md").write_text("reviewer")
+        (source / ".agent-catalog-signing-key").write_bytes(b"x" * 32)
+        archive = tmp_path / "source.tar.gz"
+
+        export_profile("source", str(archive))
+        imported = import_profile(str(archive), name="imported")
+
+        assert (imported / "agents" / "reviewer.md").read_text() == "reviewer"
+        assert not (imported / ".agent-catalog-signing-key").exists()
 
 
     def test_export_default_handles_broken_symlinks(self, profile_env, tmp_path):

@@ -1478,6 +1478,34 @@ def init_agent(
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    # Preserve the exact pre-deferred registry authority. ``agent.tools`` may
+    # contain only bridge schemas after tool-search assembly, while delegated
+    # children still need a non-widening intersection with underlying names.
+    try:
+        agent._raw_authorized_tool_names = {
+            name
+            for tool in _ra().get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            if isinstance(name := (tool.get("function") or {}).get("name"), str)
+        }
+    except Exception:
+        agent._raw_authorized_tool_names = set()
+    try:
+        from tools.mcp_tool import get_mcp_server_for_tool
+
+        agent._exact_mcp_tool_owners = {
+            name: owner
+            for name in agent._raw_authorized_tool_names
+            if (owner := get_mcp_server_for_tool(name)) is not None
+        }
+    except Exception:
+        # Fail closed for provenance-dependent authority. A later exact child
+        # cannot inherit an MCP owner that was not captured here.
+        agent._exact_mcp_tool_owners = {}
     if agent.tools and agent._agent_catalog.entries:
         catalog_names = [
             entry.definition.name for entry in agent._agent_catalog.entries
