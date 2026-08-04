@@ -1175,6 +1175,7 @@ def test_agent_definitions_rpc_returns_allowlisted_projection(monkeypatch, tmp_p
             "fallback_count": 1,
             "tools_allow": None,
             "mcp_allow": None,
+            "skills": [],
             "relative_path": "researcher.md",
             "digest": payload["definitions"][0]["digest"],
         }
