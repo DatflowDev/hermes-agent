@@ -9,7 +9,13 @@ from agent.system_prompt import build_system_prompt
 from tools.delegate_tool import _build_child_agent, _run_single_child
 
 
-def _write_definition(root: Path, *, identity: str, body: str) -> None:
+def _write_definition(
+    root: Path,
+    *,
+    identity: str,
+    body: str,
+    extra: str = "",
+) -> None:
     agents = root / "agents"
     agents.mkdir(exist_ok=True)
     (agents / "reviewer.md").write_text(
@@ -17,6 +23,7 @@ def _write_definition(root: Path, *, identity: str, body: str) -> None:
         "name: reviewer\n"
         "description: Review releases\n"
         f"identity: {identity}\n"
+        f"{extra}"
         "---\n"
         f"{body}\n"
     )
@@ -139,6 +146,48 @@ def test_profile_definition_end_to_end_uses_cached_additive_system_message(tmp_p
     assert body not in kwargs["ephemeral_system_prompt"]
     assert kwargs["load_soul_identity"] is True
     assert kwargs["identity_override"] is None
+
+
+def test_startup_skill_end_to_end_is_stable_guidance_not_authority(tmp_path):
+    skill = tmp_path / "skills" / "grounded-citations"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: grounded-citations\ndescription: Cite evidence\n---\n"
+        "Always cite primary evidence.\n"
+    )
+    _write_definition(
+        tmp_path,
+        identity="profile",
+        body="Review releases.",
+        extra="tools:\n  allow: [read_file]\nskills: [grounded-citations]\n",
+    )
+    catalog = discover_profile_agents(tmp_path)
+    definition = catalog.entries[0].definition
+    parent = _parent(catalog)
+    parent._exact_tool_allowlist = frozenset({"read_file", "terminal"})
+
+    with patch("run_agent.AIAgent") as agent_cls:
+        child = MagicMock()
+        agent_cls.return_value = child
+        _build_child_agent(
+            task_index=0,
+            goal="Review",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=10,
+            parent_agent=parent,
+            task_count=1,
+            agent_definition=definition,
+            exact_tool_allowlist={"read_file"},
+        )
+        kwargs = agent_cls.call_args.kwargs
+
+    guidance = child._agent_definition_system_message
+    assert "Review releases." in guidance
+    assert "Always cite primary evidence." in guidance
+    assert "Always cite primary evidence." not in kwargs["ephemeral_system_prompt"]
+    assert child._exact_tool_allowlist == frozenset({"read_file"})
 
 
 def test_stale_definition_fails_before_dispatch(tmp_path):

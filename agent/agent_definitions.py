@@ -13,11 +13,20 @@ import os
 import re
 import secrets
 import stat
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, NoReturn
 
 import yaml
+
+from agent.startup_skills import (
+    MAX_STARTUP_SKILL_BYTES,
+    MAX_STARTUP_SKILLS_TOTAL_BYTES,
+    MAX_STARTUP_SKILLS,
+    StartupSkillError,
+    StartupSkillPin,
+    resolve_startup_skills,
+)
 
 MAX_AGENT_FILE_BYTES = 32 * 1024
 MAX_AGENT_FILES = 64
@@ -38,8 +47,9 @@ MAX_NAME_CHARS = 64
 _NAME_RE = re.compile(r"[a-z][a-z0-9-]{0,63}\Z")
 _INTERPOLATION_RE = re.compile(r"\$\{|\{\{")
 _ALLOWED_FIELDS = frozenset(
-    {"name", "description", "identity", "provider", "model", "fallbacks", "tools", "mcp"}
+    {"name", "description", "identity", "provider", "model", "fallbacks", "tools", "mcp", "skills"}
 )
+_SKILL_NAME_RE = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}\Z")
 _ALLOWED_ROUTE_FIELDS = frozenset({"provider", "model"})
 _ALLOWED_RESTRICTION_FIELDS = frozenset({"allow"})
 _SNAPSHOT_KEY_FILE = ".agent-catalog-signing-key"
@@ -169,6 +179,8 @@ class AgentDefinition:
     fallbacks: tuple[AgentFallbackRoute, ...] | None
     tools_allow: tuple[str, ...] | None
     mcp_allow: tuple[str, ...] | None
+    skills: tuple[str, ...]
+    skill_pins: tuple[StartupSkillPin, ...]
     relative_path: str
     full_digest: str
 
@@ -237,6 +249,7 @@ class AgentCatalog:
                         if entry.definition.mcp_allow is None
                         else list(entry.definition.mcp_allow)
                     ),
+                    "skills": list(entry.definition.skills),
                     "relative_path": entry.definition.relative_path,
                     "digest": entry.definition.full_digest,
                 }
@@ -318,6 +331,21 @@ def _parse_allowlist(
             _fail(f"{field}.allow entries must be unique", error_code)
         seen.add(identifier)
         result.append(identifier)
+    return tuple(result)
+
+
+def _parse_skill_names(value: Any, *, error_code: str = "AGENT_SKILL_RESTRICTION_INVALID") -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or len(value) > MAX_STARTUP_SKILLS:
+        _fail("skills must be a bounded list", error_code)
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not _SKILL_NAME_RE.fullmatch(item):
+            _fail("skills entries must be canonical skill names", error_code)
+        if item in result:
+            _fail("skills entries must be unique", error_code)
+        result.append(item)
     return tuple(result)
 
 
@@ -424,6 +452,7 @@ def parse_agent_definition(raw_bytes: bytes, relative_path: Path | str) -> Agent
         limit=MAX_MCP_SERVERS,
         error_code="AGENT_MCP_RESTRICTION_INVALID",
     )
+    skills = _parse_skill_names(metadata.get("skills"))
 
     try:
         body_text = body_bytes.decode("utf-8").strip()
@@ -455,6 +484,8 @@ def parse_agent_definition(raw_bytes: bytes, relative_path: Path | str) -> Agent
         fallbacks=fallbacks,
         tools_allow=tools_allow,
         mcp_allow=mcp_allow,
+        skills=skills,
+        skill_pins=(),
         relative_path=relative,
         full_digest=hashlib.sha256(raw_bytes).hexdigest(),
     )
@@ -619,6 +650,30 @@ def discover_profile_agents(profile_root: Path | str) -> AgentCatalog:
                 )
             )
 
+    requested_skills = tuple(
+        dict.fromkeys(
+            skill
+            for entry in loaded
+            for skill in entry.definition.skills
+        )
+    )
+    if requested_skills:
+        try:
+            catalog_skill_pins = resolve_startup_skills(profile, requested_skills)
+        except StartupSkillError as exc:
+            _fail(str(exc), "AGENT_SKILL_UNAVAILABLE")
+        pins_by_name = {pin.name: pin for pin in catalog_skill_pins}
+        loaded = [
+            replace(
+                entry,
+                definition=replace(
+                    entry.definition,
+                    skill_pins=tuple(pins_by_name[name] for name in entry.definition.skills),
+                ),
+            )
+            for entry in loaded
+        ]
+
     loaded.sort(key=lambda entry: entry.definition.relative_path)
     names: set[str] = set()
     for entry in loaded:
@@ -630,7 +685,14 @@ def discover_profile_agents(profile_root: Path | str) -> AgentCatalog:
         names.add(entry.definition.name)
     loaded.sort(key=lambda entry: entry.definition.name)
     revision_input = "\n".join(
-        f"{entry.definition.relative_path}\0{entry.definition.full_digest}" for entry in loaded
+        "\0".join(
+            [
+                entry.definition.relative_path,
+                entry.definition.full_digest,
+                *(pin.digest for pin in entry.definition.skill_pins),
+            ]
+        )
+        for entry in loaded
     ).encode()
     return AgentCatalog(
         profile_root=profile,
@@ -651,6 +713,7 @@ def reload_catalog_entry(entry: AgentCatalogEntry) -> AgentDefinition:
             current_entry is None
             or current_entry.definition.relative_path != entry.definition.relative_path
             or current_entry.definition.full_digest != entry.definition.full_digest
+            or current_entry.definition.skill_pins != entry.definition.skill_pins
         ):
             _fail("persisted agent definition is no longer current", "STALE_AGENT_DEFINITION")
         return current_entry.definition
@@ -674,7 +737,13 @@ def reload_catalog_entry(entry: AgentCatalogEntry) -> AgentDefinition:
     definition = parse_agent_definition(raw, entry.definition.relative_path)
     if definition.full_digest != entry.definition.full_digest or definition.name != entry.definition.name:
         _fail("agent definition content changed", "STALE_AGENT_DEFINITION")
-    return definition
+    try:
+        skill_pins = resolve_startup_skills(agents_root.parent, definition.skills)
+    except StartupSkillError as exc:
+        _fail(str(exc), "STALE_AGENT_DEFINITION")
+    if skill_pins != entry.definition.skill_pins:
+        _fail("startup skill content changed", "STALE_AGENT_DEFINITION")
+    return replace(definition, skill_pins=skill_pins)
 
 
 def snapshot_agent_catalog(catalog: AgentCatalog) -> dict[str, Any]:
@@ -703,6 +772,16 @@ def snapshot_agent_catalog(catalog: AgentCatalog) -> dict[str, Any]:
             "mcp_allow": (
                 None if definition.mcp_allow is None else list(definition.mcp_allow)
             ),
+            "skills": list(definition.skills),
+            "skill_pins": [
+                {
+                    "name": pin.name,
+                    "relative_path": pin.relative_path,
+                    "digest": pin.digest,
+                    "content": pin.content,
+                }
+                for pin in definition.skill_pins
+            ],
             "relative_path": definition.relative_path,
             "full_digest": definition.full_digest,
         }
@@ -710,7 +789,7 @@ def snapshot_agent_catalog(catalog: AgentCatalog) -> dict[str, Any]:
         return {**payload, "snapshot_digest": hashlib.sha256(canonical).hexdigest()}
 
     snapshot = {
-        "version": 1,
+        "version": 2,
         "revision": catalog.revision,
         "definitions": [snapshot_definition(entry) for entry in catalog.entries],
     }
@@ -730,7 +809,7 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
     if (
         not isinstance(snapshot, dict)
         or set(snapshot) != {"version", "revision", "definitions", "catalog_mac"}
-        or snapshot.get("version") != 1
+        or snapshot.get("version") not in {1, 2}
     ):
         _fail("stored agent catalog snapshot is invalid", "STALE_AGENT_DEFINITION")
     profile = Path(profile_root).absolute()
@@ -758,7 +837,7 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
     entries: list[AgentCatalogEntry] = []
     total_bytes = 0
     for raw in definitions:
-        if not isinstance(raw, dict) or set(raw) != {
+        expected_fields = {
             "name",
             "description",
             "identity",
@@ -771,7 +850,10 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
             "relative_path",
             "full_digest",
             "snapshot_digest",
-        }:
+        }
+        if snapshot["version"] == 2:
+            expected_fields.update({"skills", "skill_pins"})
+        if not isinstance(raw, dict) or set(raw) != expected_fields:
             _fail("stored agent definition is invalid", "STALE_AGENT_DEFINITION")
         snapshot_digest = raw["snapshot_digest"]
         digest_payload = {key: value for key, value in raw.items() if key != "snapshot_digest"}
@@ -820,6 +902,54 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
             limit=MAX_MCP_SERVERS,
             error_code="STALE_AGENT_DEFINITION",
         )
+        if snapshot["version"] == 1:
+            skills: tuple[str, ...] = ()
+            skill_pins: tuple[StartupSkillPin, ...] = ()
+        else:
+            skills = _parse_skill_names(raw["skills"], error_code="STALE_AGENT_DEFINITION")
+            raw_pins = raw["skill_pins"]
+            if not isinstance(raw_pins, list) or len(raw_pins) != len(skills):
+                _fail("stored startup skill pins are invalid", "STALE_AGENT_DEFINITION")
+            parsed_pins: list[StartupSkillPin] = []
+            restored_skill_bytes = 0
+            for pin in raw_pins:
+                if not isinstance(pin, dict) or set(pin) != {"name", "relative_path", "digest", "content"}:
+                    _fail("stored startup skill pins are invalid", "STALE_AGENT_DEFINITION")
+                if not all(isinstance(pin[field], str) for field in pin):
+                    _fail("stored startup skill pins are invalid", "STALE_AGENT_DEFINITION")
+                name = pin["name"]
+                relative_path = pin["relative_path"]
+                digest = pin["digest"]
+                content = pin["content"]
+                relative = Path(relative_path)
+                if (
+                    not _SKILL_NAME_RE.fullmatch(name)
+                    or relative.is_absolute()
+                    or relative.suffix != ".md"
+                    or any(part in {"", ".", ".."} for part in relative.parts)
+                    or len(relative_path.encode("utf-8")) > MAX_RELATIVE_PATH_BYTES
+                    or not re.fullmatch(r"[0-9a-f]{64}", digest)
+                ):
+                    _fail("stored startup skill pins are invalid", "STALE_AGENT_DEFINITION")
+                content_bytes = content.encode("utf-8")
+                restored_skill_bytes += len(content_bytes)
+                if (
+                    len(content_bytes) > MAX_STARTUP_SKILL_BYTES
+                    or restored_skill_bytes > MAX_STARTUP_SKILLS_TOTAL_BYTES
+                ):
+                    _fail("stored startup skill pins exceed their limit", "STALE_AGENT_DEFINITION")
+                parsed = StartupSkillPin(
+                    name=name,
+                    relative_path=relative_path,
+                    digest=digest,
+                    content=content,
+                )
+                if hashlib.sha256(content_bytes).hexdigest() != parsed.digest:
+                    _fail("stored startup skill digest is invalid", "STALE_AGENT_DEFINITION")
+                parsed_pins.append(parsed)
+            skill_pins = tuple(parsed_pins)
+            if tuple(pin.name for pin in skill_pins) != skills:
+                _fail("stored startup skill pins are invalid", "STALE_AGENT_DEFINITION")
         relative = Path(str(raw["relative_path"]))
         definition = AgentDefinition(
             name=str(raw["name"]),
@@ -831,6 +961,8 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
             fallbacks=fallbacks,
             tools_allow=tools_allow,
             mcp_allow=mcp_allow,
+            skills=skills,
+            skill_pins=skill_pins,
             relative_path=relative.as_posix(),
             full_digest=str(raw["full_digest"]),
         )
@@ -851,6 +983,7 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
                     ),
                     **({"tools": {"allow": list(tools_allow)}} if tools_allow is not None else {}),
                     **({"mcp": {"allow": list(mcp_allow)}} if mcp_allow is not None else {}),
+                    **({"skills": list(skills)} if skills else {}),
                 }
             )
             + "\n---\n"
@@ -861,6 +994,7 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
             **{
                 **validated.__dict__,
                 "fallbacks": fallbacks,
+                "skill_pins": skill_pins,
                 "full_digest": definition.full_digest,
             }
         )
@@ -879,7 +1013,14 @@ def restore_agent_catalog(snapshot: Any, profile_root: Path | str) -> AgentCatal
         )
     calculated = hashlib.sha256(
         "\n".join(
-            f"{entry.definition.relative_path}\0{entry.definition.full_digest}" for entry in entries
+            "\0".join(
+                [
+                    entry.definition.relative_path,
+                    entry.definition.full_digest,
+                    *(pin.digest for pin in entry.definition.skill_pins),
+                ]
+            )
+            for entry in entries
         ).encode()
     ).hexdigest()
     if calculated != revision:

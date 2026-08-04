@@ -37,6 +37,8 @@ tools:
 mcp:
   allow:
     - context7
+skills:
+  - grounded-citations
 ---
 
 Verify claims against current authoritative sources. Return concise findings with links.
@@ -54,6 +56,11 @@ Optional routing fields:
 - `provider` and `model`: configured route identifiers, never credentials or endpoints. An explicit provider requires an explicit model.
 - `fallbacks`: ordered `{provider, model}` routes. Omission inherits the delegation fallback chain; `[]` disables per-agent fallbacks; a non-empty list replaces the inherited chain.
 
+Optional startup guidance:
+
+- `skills`: ordered canonical skill names to load when the delegated child is created. Hermes pins each skill's exact `SKILL.md` bytes in the signed conversation catalog, rejects missing, disabled, ambiguous, linked, changed, or oversized skills, and injects the authenticated contents through the same stable prompt tier as the agent definition.
+- Startup loading is deliberately passive: it does not run inline shell, setup, secret capture, template substitution, or usage hooks. Skill declarations never add tools or toolsets.
+
 Unknown fields, duplicate routes, unsafe YAML features, malformed files, unsafe path permissions, links, and scanner-positive system-authority content are rejected.
 
 ## Identity modes
@@ -66,6 +73,8 @@ Hermes' normal tool rules, task/context guidance, workspace, platform, lifecycle
 ## Tool and MCP restrictions
 
 `tools.allow` and `mcp.allow` only narrow authority. They cannot grant anything the parent agent does not already have.
+
+`skills` is guidance, not authority. Declaring a skill does not change the intersection below.
 
 ```text
 child authority = parent exact authority ∩ requested allowlist ∩ role policy
@@ -110,6 +119,7 @@ Common fail-closed errors include:
 - `STALE_AGENT_DEFINITION`: catalog revision, file identity, path, name, or digest changed;
 - `AGENT_TOOL_UNAVAILABLE`: a requested tool is absent from parent authority;
 - `AGENT_MCP_UNAVAILABLE`: a requested MCP server is absent from parent authority;
+- `AGENT_SKILL_UNAVAILABLE`: a declared startup skill is missing, disabled, ambiguous, unsafe, or cannot be loaded under the profile skill root;
 - `AGENT_ROUTE_UNAVAILABLE`: the configured route cannot resolve;
 - `AGENT_LAUNCH_REPLAY`: a typed launch request was already consumed.
 

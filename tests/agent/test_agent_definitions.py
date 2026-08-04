@@ -13,6 +13,7 @@ from agent.agent_definitions import (
     MAX_BODY_BYTES,
     MAX_DESCRIPTION_CHARS,
     MAX_MCP_SERVERS,
+    MAX_STARTUP_SKILLS,
     MAX_TOOL_IDENTIFIERS,
     AgentDefinitionError,
     discover_profile_agents,
@@ -58,6 +59,8 @@ def test_parse_minimal_profile_definition() -> None:
     assert definition.fallbacks is None
     assert definition.tools_allow is None
     assert definition.mcp_allow is None
+    assert definition.skills == ()
+    assert definition.skill_pins == ()
     assert definition.relative_path == "research/researcher.md"
     assert len(definition.full_digest) == 64
 
@@ -111,6 +114,28 @@ def test_parse_tool_and_mcp_allowlists() -> None:
 
     assert definition.tools_allow == ("web_search", "web_extract")
     assert definition.mcp_allow == ("context7",)
+
+
+def test_parse_startup_skills_is_bounded_and_canonical() -> None:
+    definition = parse_agent_definition(
+        _definition(extra="skills: [grounded-citations, source-review]\n"),
+        Path("research/researcher.md"),
+    )
+    assert definition.skills == ("grounded-citations", "source-review")
+
+    for invalid in (
+        "skills: grounded-citations\n",
+        "skills: [Grounded-Citations]\n",
+        "skills: [grounded-citations, grounded-citations]\n",
+        "skills: [category/grounded-citations]\n",
+    ):
+        _assert_error(_definition(extra=invalid), "AGENT_SKILL_RESTRICTION_INVALID")
+
+    too_many = ", ".join(f"skill-{index}" for index in range(MAX_STARTUP_SKILLS + 1))
+    _assert_error(
+        _definition(extra=f"skills: [{too_many}]\n"),
+        "AGENT_SKILL_RESTRICTION_INVALID",
+    )
 
 
 @pytest.mark.parametrize(
@@ -363,6 +388,120 @@ def test_persisted_catalog_snapshot_preserves_history_but_revokes_changed_source
     assert exc.value.code == "STALE_AGENT_DEFINITION"
 
 
+def test_catalog_pins_startup_skill_and_revokes_changed_skill(tmp_path: Path) -> None:
+    from agent.agent_definitions import restore_agent_catalog, snapshot_agent_catalog
+
+    skills = tmp_path / "skills" / "grounded-citations"
+    skills.mkdir(parents=True)
+    skill_file = skills / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: grounded-citations\ndescription: Cite sources\n---\nOriginal skill.\n"
+    )
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "reviewer.md").write_bytes(
+        _definition(name="reviewer", extra="skills: [grounded-citations]\n")
+    )
+
+    catalog = discover_profile_agents(tmp_path)
+    entry = catalog.get("reviewer")
+    assert entry is not None
+    assert entry.definition.skills == ("grounded-citations",)
+    assert entry.definition.skill_pins[0].content.rstrip().endswith("Original skill.")
+    restored = restore_agent_catalog(snapshot_agent_catalog(catalog), tmp_path)
+    restored_entry = restored.get("reviewer")
+    assert restored_entry is not None
+    assert restored_entry.definition.skill_pins == entry.definition.skill_pins
+
+    skill_file.write_text(
+        "---\nname: grounded-citations\ndescription: Cite sources\n---\nChanged skill.\n"
+    )
+    with pytest.raises(AgentDefinitionError) as exc:
+        reload_catalog_entry(entry)
+    assert exc.value.code == "STALE_AGENT_DEFINITION"
+    with pytest.raises(AgentDefinitionError) as restored_exc:
+        reload_catalog_entry(restored_entry)
+    assert restored_exc.value.code == "STALE_AGENT_DEFINITION"
+
+
+def test_restore_accepts_authenticated_version_one_snapshot(tmp_path: Path) -> None:
+    from agent.agent_definitions import (
+        _catalog_snapshot_key,
+        _snapshot_mac,
+        restore_agent_catalog,
+        snapshot_agent_catalog,
+    )
+
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "reviewer.md").write_bytes(_definition(name="reviewer"))
+    snapshot = snapshot_agent_catalog(discover_profile_agents(tmp_path))
+    snapshot["version"] = 1
+    for definition in snapshot["definitions"]:
+        definition.pop("skills")
+        definition.pop("skill_pins")
+        payload = {key: value for key, value in definition.items() if key != "snapshot_digest"}
+        definition["snapshot_digest"] = hashlib.sha256(
+            json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    unsigned = {key: value for key, value in snapshot.items() if key != "catalog_mac"}
+    snapshot["catalog_mac"] = _snapshot_mac(
+        unsigned,
+        _catalog_snapshot_key(tmp_path, create=False),
+    )
+
+    restored = restore_agent_catalog(snapshot, tmp_path)
+    restored_entry = restored.get("reviewer")
+    assert restored_entry is not None
+    assert restored_entry.definition.skills == ()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("name", 123),
+        ("relative_path", "../SKILL.md"),
+        ("digest", "A" * 64),
+        ("content", "x" * (64 * 1024 + 1)),
+    ],
+)
+def test_restore_rejects_malformed_or_oversized_skill_pins(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    from agent.agent_definitions import (
+        _catalog_snapshot_key,
+        _snapshot_mac,
+        restore_agent_catalog,
+        snapshot_agent_catalog,
+    )
+
+    skill = tmp_path / "skills" / "grounded-citations"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: grounded-citations\ndescription: Cite\n---\nCite.\n"
+    )
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "reviewer.md").write_bytes(
+        _definition(name="reviewer", extra="skills: [grounded-citations]\n")
+    )
+    snapshot = snapshot_agent_catalog(discover_profile_agents(tmp_path))
+    definition = snapshot["definitions"][0]
+    definition["skill_pins"][0][field] = value
+    payload = {key: item for key, item in definition.items() if key != "snapshot_digest"}
+    definition["snapshot_digest"] = hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    unsigned = {key: item for key, item in snapshot.items() if key != "catalog_mac"}
+    snapshot["catalog_mac"] = _snapshot_mac(
+        unsigned, _catalog_snapshot_key(tmp_path, create=False)
+    )
+
+    with pytest.raises(AgentDefinitionError) as exc:
+        restore_agent_catalog(snapshot, tmp_path)
+    assert exc.value.code == "STALE_AGENT_DEFINITION"
+
+
 def test_reload_rejects_catalog_collision_added_after_discovery(tmp_path: Path) -> None:
     agents = tmp_path / "agents"
     agents.mkdir()
@@ -407,7 +546,7 @@ def test_empty_catalog_snapshot_does_not_require_a_signing_key(tmp_path: Path) -
     snapshot = snapshot_agent_catalog(catalog)
 
     assert snapshot == {
-        "version": 1,
+        "version": 2,
         "revision": hashlib.sha256(b"").hexdigest(),
         "definitions": [],
         "catalog_mac": None,
