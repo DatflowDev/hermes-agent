@@ -36,6 +36,7 @@ from tools.delegate_tool import (
     _run_single_child,
 )
 from agent.agent_definitions import discover_profile_agents
+from agent.startup_skills import StartupSkillPin
 
 
 def _make_mock_parent(depth=0):
@@ -432,6 +433,44 @@ class TestDelegateTask(unittest.TestCase):
             kwargs["fallback_model"],
             [{"provider": "backup-provider", "model": "backup-model"}],
         )
+
+    def test_selected_agent_startup_skills_join_stable_guidance_only(self):
+        parent = _make_mock_parent(depth=0)
+        definition = SimpleNamespace(
+            name="researcher",
+            identity="profile",
+            instructions="Verify every source.",
+            skill_pins=(
+                StartupSkillPin(
+                    name="grounded-citations",
+                    relative_path="grounded-citations/SKILL.md",
+                    digest="a" * 64,
+                    content="Always cite primary sources.",
+                ),
+            ),
+            provider=None,
+            model=None,
+            fallbacks=None,
+            full_digest="d" * 64,
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            _build_child_agent(
+                0,
+                "Research",
+                None,
+                None,
+                None,
+                10,
+                1,
+                parent,
+                agent_definition=definition,
+            )
+
+        guidance = MockAgent.return_value._agent_definition_system_message
+        self.assertIn("Verify every source.", guidance)
+        self.assertIn("Always cite primary sources.", guidance)
+        self.assertNotIn("Always cite primary sources.", MockAgent.call_args.kwargs["ephemeral_system_prompt"])
 
     def test_selected_replace_identity_replaces_soul_without_duplication(self):
         parent = _make_mock_parent(depth=0)

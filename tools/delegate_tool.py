@@ -1367,6 +1367,20 @@ def _build_child_agent(
     from run_agent import AIAgent
     import uuid as _uuid
 
+    definition_guidance = (
+        agent_definition.instructions if agent_definition is not None else None
+    )
+    definition_skill_pins = tuple(
+        getattr(agent_definition, "skill_pins", ()) or ()
+    )
+    if definition_skill_pins:
+        from agent.startup_skills import render_startup_skills
+
+        skills_guidance = render_startup_skills(definition_skill_pins)
+        definition_guidance = "\n\n".join(
+            part for part in (definition_guidance, skills_guidance) if part
+        )
+
     # Exact authority is transitive. A restricted orchestrator that delegates
     # without selecting another restricted definition must not fall back to
     # rebuilding authority from its broader inherited toolsets. Keep this
@@ -1690,7 +1704,7 @@ def _build_child_agent(
                 agent_definition is None or agent_definition.identity == "profile"
             ),
             identity_override=(
-                agent_definition.instructions
+                definition_guidance
                 if agent_definition is not None and agent_definition.identity == "replace"
                 else None
             ),
@@ -1808,7 +1822,7 @@ def _build_child_agent(
     # tier, not the ephemeral task framing. _run_single_child threads this
     # immutable value through every prompt rebuild.
     child._agent_definition_system_message = (
-        agent_definition.instructions
+        definition_guidance
         if agent_definition is not None and agent_definition.identity == "profile"
         else None
     )
