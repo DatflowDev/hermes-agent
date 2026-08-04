@@ -14,7 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_ARTIFACTS = ROOT / "session-test-artifacts"
-LOG_TOOL = re.compile(r"^\d\d:\d\d:\d\d tool\s+\| -> ([A-Za-z0-9_]+)", re.MULTILINE)
+LOG_TOOL = re.compile(r"^\d\d:\d\d:\d\d tool\s+\| -> ([A-Za-z0-9_.-]+)", re.MULTILINE)
+EXPECTED_HERMES_HOME = Path.home() / ".hermes" / "profiles" / "hermes-agents-skills-test"
 
 
 def artifact_dir(root: Path, scenario: str) -> Path:
@@ -76,6 +77,9 @@ def validate_logs(
     parent_session_ids: list[str],
     artifact: Path,
 ) -> dict:
+    hermes_home = hermes_home.expanduser().resolve(strict=True)
+    if hermes_home != EXPECTED_HERMES_HOME.resolve():
+        raise ValueError(f"Phase E requires the dedicated profile: {EXPECTED_HERMES_HOME}")
     expected = {
         "researcher": {"allowed": {"read_file", "web_search", "web_extract", "search_files"}, "forbidden": {"terminal", "write_file", "patch"}},
         "code-reviewer": {"allowed": {"read_file", "search_files", "terminal", "web_search", "web_extract"}, "forbidden": {"write_file", "patch"}},
@@ -106,17 +110,23 @@ def validate_logs(
             forbidden_seen = sorted(tools & policy["forbidden"])
             allowed_seen = sorted(tools & policy["allowed"])
             model_matches = [model for session_id, model in models.items() if session_id in log]
+            if len(model_matches) > 1:
+                raise RuntimeError(f"{delegation_id} task {task['index']}: ambiguous child session")
             if not model_matches:
                 # Live transcripts do not print the child session id. Identity order is
                 # unambiguous in state.db, so bind by the selected identity prompt.
                 with sqlite3.connect(hermes_home / "state.db") as conn:
-                    row = conn.execute(
+                    rows = conn.execute(
                         "SELECT model FROM sessions WHERE parent_session_id IN (%s) "
-                        "AND system_prompt LIKE ? ORDER BY started_at LIMIT 1"
+                        "AND system_prompt LIKE ? ORDER BY started_at"
                         % ",".join("?" for _ in parent_session_ids),
                         [*parent_session_ids, f"%{identity_markers[name]}%"],
-                    ).fetchone()
-                model = row[0] if row else None
+                    ).fetchall()
+                if len(rows) != 1:
+                    raise RuntimeError(
+                        f"{delegation_id} task {task['index']}: expected exactly one identity-bound child session"
+                    )
+                model = rows[0][0]
             else:
                 model = model_matches[0]
             model_ok = bool(model) and model.startswith(("cx/gpt-5.6-terra-", "cx/gpt-5.6-luna-"))
@@ -139,11 +149,18 @@ def validate_logs(
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--artifact-root", type=Path, default=DEFAULT_ARTIFACTS)
-    parser.add_argument("--hermes-home", type=Path, default=Path.home() / ".hermes")
+    parser.add_argument("--hermes-home", type=Path, required=True)
     parser.add_argument("--delegation-id", action="append", default=[])
     parser.add_argument("--parent-session-id", action="append", default=[])
     parser.add_argument("--voice-only", action="store_true")
     args = parser.parse_args()
+
+    if not args.voice_only:
+        if not args.delegation_id or not args.parent_session_id:
+            parser.error("agent validation requires delegation and parent session IDs")
+        args.hermes_home = args.hermes_home.expanduser().resolve(strict=True)
+        if args.hermes_home != EXPECTED_HERMES_HOME.resolve():
+            parser.error(f"--hermes-home must be the dedicated profile: {EXPECTED_HERMES_HOME}")
 
     artifact = artifact_dir(args.artifact_root.resolve(), "PHASE-E-VOICE-AGENTS")
     voice = run_voice(artifact)

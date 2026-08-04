@@ -510,11 +510,12 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
 
     # ── Volatile tier (most likely to differ on a rebuild; kept last so the stable prefix stays reusable) ──
     volatile_parts: List[str] = []
-    # Skills are runtime-mutable: the agent adds and patches them across a
-    # session (SKILLS_GUIDANCE tells it to patch a skill the moment it goes
-    # stale). The built prompt is cached per session and only rebuilt on
-    # compaction/restore (see build_system_prompt), so a skill change is not
-    # byte-stable across rebuilds. With the index in the stable band, a rebuild
+    # The general skills index is runtime-mutable: the agent adds and patches
+    # skills across a session. The built prompt is cached per session and only
+    # rebuilt on compaction/restore, so a general skill change is not byte-stable
+    # across rebuilds. Agent-declared startup skills are different: their exact
+    # bytes are catalog-pinned and composed into stable definition guidance.
+    # With the general index in the stable band, a rebuild
     # that picked up a skill change would bust the cached prefix from the index
     # down, taking the whole scaffold with it. Render it at the FRONT of the
     # volatile band instead, ahead of the turn-varying memory/timestamp tail:

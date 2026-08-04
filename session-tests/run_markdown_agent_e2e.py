@@ -120,6 +120,16 @@ def _tool_events(transcript: str) -> list[str]:
     return re.findall(r"\btool\s+\|\s+->\s+([A-Za-z0-9_.-]+)\(", transcript)
 
 
+def require_isolated_hermes_home(hermes_home: Path) -> Path:
+    """Accept only the dedicated E2E profile, never the live default profile."""
+
+    resolved = hermes_home.expanduser().resolve(strict=True)
+    expected = (Path.home() / ".hermes" / "profiles" / "hermes-agents-skills-test").resolve()
+    if resolved != expected:
+        raise ValueError(f"E2E evidence requires the dedicated profile: {expected}")
+    return resolved
+
+
 def capture_delegation(
     *,
     hermes_home: Path,
@@ -131,6 +141,7 @@ def capture_delegation(
     model: str,
     provider: str,
 ) -> Path:
+    hermes_home = require_isolated_hermes_home(hermes_home)
     reject_secrets(" ".join((delegation_id, scenario_id, model, provider)))
     source = hermes_home / "cache" / "delegation" / "live" / delegation_id
     transcript_path = source / "task-0.log"
@@ -141,6 +152,8 @@ def capture_delegation(
     transcript = transcript_path.read_text(encoding="utf-8")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     reject_secrets(transcript)
+    manifest_text = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+    reject_secrets(manifest_text)
     tools = _tool_events(transcript)
     seen = set(tools)
     allowed_seen = sorted(seen & allowed)
@@ -161,7 +174,7 @@ def capture_delegation(
         },
     )
     shutil.copy2(transcript_path, artifact / "transcript.log")
-    shutil.copy2(manifest_path, artifact / "manifest.json")
+    _write_json(artifact / "manifest.json", manifest)
     db_evidence = _query_delegation(hermes_home / "state.db", delegation_id)
     _write_json(artifact / "db-evidence.json", db_evidence)
     effects = {
