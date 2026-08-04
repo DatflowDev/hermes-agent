@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
 import { useStore } from '@nanostores/react'
+import { useCallback, useEffect, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
@@ -40,6 +40,7 @@ export function AgentDefinitions() {
   const load = useCallback(async () => {
     setLoading(true)
     setError('')
+
     try {
       const result = await requestGateway<AgentDefinitionsResponse>('agent_definitions.list', { session_id: sessionId })
       setDefinitions(result.definitions ?? [])
@@ -54,10 +55,14 @@ export function AgentDefinitions() {
   const launch = useCallback(
     async (definition: AgentDefinitionProjection) => {
       const task = (tasks[definition.definition_id] ?? '').trim()
-      if (!sessionId || !task) return
+      if (!sessionId || !task) {
+        return
+      }
+
       setLaunching(definition.definition_id)
       setNotice('')
       setNoticeIsError(false)
+
       try {
         await requestGateway('agent_definitions.launch', {
           definition_id: definition.definition_id,
@@ -125,6 +130,7 @@ export function AgentDefinitions() {
       <ul className="space-y-1" role="list">
       {definitions.map(definition => {
         const route = [definition.provider, definition.model].filter(Boolean).join(' / ') || 'inherits delegation route'
+
         return (
           <li className="rounded-md px-3 py-2.5 hover:bg-muted/40" key={`${definition.name}:${definition.digest}`}>
             <div className="flex min-w-0 items-start justify-between gap-3">

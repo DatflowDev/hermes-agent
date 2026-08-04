@@ -9,6 +9,7 @@ vi.mock('@/app/gateway/hooks/use-gateway-request', () => ({
 
 vi.mock('@/app/chat/session-view', async () => {
   const { atom } = await import('nanostores')
+
   return { useSessionView: () => ({ $runtimeId: atom('session-1') }) }
 })
 

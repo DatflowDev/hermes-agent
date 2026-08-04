@@ -1,7 +1,8 @@
+import { randomUUID } from 'node:crypto'
+
 import { Box, NoSelect, ScrollBox, type ScrollBoxHandle, Text, useInput, useStdout } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
-import { randomUUID } from 'node:crypto'
 
 import {
   $delegationState,
@@ -838,6 +839,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, sessionId,
       if (key.escape) {
         setDefinitionEditing(false)
       }
+
       return
     }
 
@@ -851,6 +853,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, sessionId,
 
     if (ch === 'd') {
       setSurface(value => (value === 'runs' ? 'definitions' : 'runs'))
+
       return
     }
 
@@ -862,6 +865,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, sessionId,
       } else if (key.return && definitions.length > 0 && sessionId) {
         setDefinitionEditing(true)
       }
+
       return
     }
 
