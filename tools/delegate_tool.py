@@ -1755,7 +1755,7 @@ def _build_child_agent(
         )
         candidate_defs.extend(
             tool
-            for tool in child.tools
+            for tool in (getattr(child, "tools", None) or [])
             if (tool.get("function") or {}).get("name")
             not in {"tool_search", "tool_describe", "tool_call"}
         )
