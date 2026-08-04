@@ -3026,12 +3026,19 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             return _finish_agent_tool(agent._dispatch_delegate_task(next_args), next_args)
     else:
         def _execute(next_args: dict) -> Any:
+            # ``agent.tools`` / ``valid_tool_names`` are model-facing and may
+            # contain only the three tool-search bridges. The underlying MCP
+            # names remain authorized in the pre-deferred snapshot.
+            execution_authority = set(agent.valid_tool_names)
+            execution_authority.update(
+                getattr(agent, "_raw_authorized_tool_names", ()) or ()
+            )
             dispatch_kwargs = dict(
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names),
+                enabled_tools=list(execution_authority),
                 authorized_mcp_owners=dict(
                     getattr(agent, "_exact_mcp_tool_owners", {}) or {}
                 ),
