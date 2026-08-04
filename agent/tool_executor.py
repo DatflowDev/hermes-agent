@@ -298,6 +298,13 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
+def _execution_authorized_tool_names(agent) -> list[str]:
+    """Return model-visible plus pre-deferred execution authority."""
+    names = set(getattr(agent, "valid_tool_names", ()) or ())
+    names.update(getattr(agent, "_raw_authorized_tool_names", ()) or ())
+    return list(names)
+
+
 @dataclass
 class _ManagedToolResult:
     result: Any
@@ -1702,9 +1709,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
-                        enabled_tools=(
-                            list(agent.valid_tool_names)
-                        ),
+                        enabled_tools=_execution_authorized_tool_names(agent),
                         authorized_mcp_owners=dict(
                             getattr(agent, "_exact_mcp_tool_owners", {}) or {}
                         ),
@@ -1781,9 +1786,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         turn_id=getattr(agent, "_current_turn_id", "") or "",
                         api_request_id=getattr(agent, "_current_api_request_id", "")
                         or "",
-                        enabled_tools=(
-                            list(agent.valid_tool_names)
-                        ),
+                        enabled_tools=_execution_authorized_tool_names(agent),
                         authorized_mcp_owners=dict(
                             getattr(agent, "_exact_mcp_tool_owners", {}) or {}
                         ),

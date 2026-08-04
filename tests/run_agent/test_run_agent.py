@@ -1885,6 +1885,7 @@ class TestConcurrentToolExecution:
                 turn_id="",
                 api_request_id="",
                 enabled_tools=list(agent.valid_tool_names),
+                authorized_mcp_owners={},
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
@@ -1892,6 +1893,22 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
+
+    def test_invoke_tool_preserves_pre_deferred_execution_authority(self, agent):
+        """MCP tools hidden behind tool_search remain callable by the bridge."""
+        agent.valid_tool_names.add("tool_describe")
+        agent._raw_authorized_tool_names = {"mcp__context7__query_docs"}
+
+        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
+            agent._invoke_tool(
+                "tool_describe",
+                {"name": "mcp__context7__query_docs"},
+                "task-1",
+            )
+
+        enabled = set(mock_hfc.call_args.kwargs["enabled_tools"])
+        assert agent.valid_tool_names <= enabled
+        assert "mcp__context7__query_docs" in enabled
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
