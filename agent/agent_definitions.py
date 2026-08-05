@@ -54,7 +54,7 @@ _ALLOWED_ROUTE_FIELDS = frozenset({"provider", "model"})
 _ALLOWED_RESTRICTION_FIELDS = frozenset({"allow"})
 _SNAPSHOT_KEY_FILE = ".agent-catalog-signing-key"
 _SNAPSHOT_KEY_BYTES = 32
-_SNAPSHOT_KEY_OPEN_RETRIES = 8
+_SNAPSHOT_KEY_OPEN_RETRIES = 100
 
 
 def _require_owned_restrictive(info: os.stat_result, label: str) -> None:
