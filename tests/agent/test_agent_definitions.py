@@ -20,6 +20,7 @@ from agent.agent_definitions import (
     parse_agent_definition,
     reload_catalog_entry,
 )
+from agent.startup_skills import MAX_STARTUP_SKILL_BYTES
 
 
 def _definition(
@@ -422,6 +423,40 @@ def test_catalog_pins_startup_skill_and_revokes_changed_skill(tmp_path: Path) ->
     with pytest.raises(AgentDefinitionError) as restored_exc:
         reload_catalog_entry(restored_entry)
     assert restored_exc.value.code == "STALE_AGENT_DEFINITION"
+
+
+def test_discovery_ignores_unrequested_oversized_startup_skill(tmp_path: Path) -> None:
+    requested = tmp_path / "skills" / "security-and-hardening"
+    requested.mkdir(parents=True)
+    requested_file = requested / "SKILL.md"
+    requested_file.write_text(
+        "---\nname: security-and-hardening\ndescription: Harden code\n---\n"
+        "Validate all requested authority.\n",
+        encoding="utf-8",
+    )
+    unrelated = tmp_path / "skills" / "unrelated-research"
+    unrelated.mkdir()
+    (unrelated / "SKILL.md").write_bytes(
+        b"---\nname: unrelated-research\ndescription: Unused\n---\n"
+        + b"x" * MAX_STARTUP_SKILL_BYTES
+    )
+    agents = tmp_path / "agents"
+    agents.mkdir()
+    (agents / "reviewer.md").write_bytes(
+        _definition(name="reviewer", extra="skills: [security-and-hardening]\n")
+    )
+
+    catalog = discover_profile_agents(tmp_path)
+
+    entry = catalog.get("reviewer")
+    assert entry is not None
+    assert entry.definition.skills == ("security-and-hardening",)
+    assert [pin.name for pin in entry.definition.skill_pins] == [
+        "security-and-hardening"
+    ]
+    assert entry.definition.skill_pins[0].content == requested_file.read_text(
+        encoding="utf-8"
+    )
 
 
 def test_restore_accepts_authenticated_version_one_snapshot(tmp_path: Path) -> None:

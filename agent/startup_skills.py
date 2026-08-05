@@ -52,9 +52,9 @@ def _read_regular_file_at(parent_fd: int, filename: str) -> bytes:
             if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
                 _fail("startup skill must be a singly-linked regular file")
             _require_owned_restrictive(before, "startup skill")
-            data = os.read(descriptor, MAX_STARTUP_SKILL_BYTES + 1)
+            data = _read_bounded(descriptor, MAX_STARTUP_SKILL_BYTES + 1)
             os.lseek(descriptor, 0, os.SEEK_SET)
-            second_read = os.read(descriptor, MAX_STARTUP_SKILL_BYTES + 1)
+            second_read = _read_bounded(descriptor, MAX_STARTUP_SKILL_BYTES + 1)
             after = os.fstat(descriptor)
         finally:
             os.close(descriptor)
@@ -71,6 +71,54 @@ def _read_regular_file_at(parent_fd: int, filename: str) -> bytes:
     ):
         _fail("startup skill changed during read")
     return data
+
+
+def _read_bounded(descriptor: int, limit: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = limit
+    while remaining:
+        chunk = os.read(descriptor, remaining)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _probe_frontmatter_name_at(parent_fd: int, filename: str, fallback: str) -> str | None:
+    """Identify a possible requested skill without validating unrelated content."""
+
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(filename, flags, dir_fd=parent_fd)
+        try:
+            before = os.fstat(descriptor)
+            if not stat.S_ISREG(before.st_mode):
+                return fallback
+            data = _read_bounded(descriptor, MAX_STARTUP_SKILL_BYTES + 1)
+            after = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        return fallback
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+    ):
+        return fallback
+    if not data.startswith(b"---\n"):
+        return fallback
+    closing = data.find(b"\n---\n", 4)
+    if closing < 0:
+        return fallback
+    try:
+        metadata = yaml.safe_load(data[4:closing].decode("utf-8")) or {}
+    except (UnicodeDecodeError, yaml.YAMLError):
+        return fallback
+    name = metadata.get("name", fallback) if isinstance(metadata, dict) else fallback
+    return name if isinstance(name, str) and name else fallback
 
 
 def _frontmatter_name(data: bytes, fallback: str) -> str:
@@ -123,6 +171,7 @@ def resolve_startup_skills(profile_root: Path | str, names: Iterable[str]) -> tu
     except OSError:
         _fail("cannot securely open the profile root")
     root_fd = -1
+    stack: list[tuple[int, tuple[str, ...], tuple[os.stat_result, ...]]] = []
     try:
         profile_info = os.fstat(profile_fd)
         _require_owned_restrictive(profile_info, "profile root")
@@ -132,10 +181,10 @@ def resolve_startup_skills(profile_root: Path | str, names: Iterable[str]) -> tu
             _fail("startup skill is unavailable: cannot securely open the profile skills root")
         root_info = os.fstat(root_fd)
         _require_owned_restrictive(root_info, "profile skills root")
-        stack: list[tuple[int, tuple[str, ...]]] = [(root_fd, ())]
+        stack = [(root_fd, (), ())]
         root_fd = -1  # ownership moved to stack
         while stack:
-            directory_fd, relative_parts = stack.pop()
+            directory_fd, relative_parts, ancestor_infos = stack.pop()
             try:
                 names_in_dir = sorted(os.listdir(directory_fd))
                 for entry_name in names_in_dir:
@@ -150,24 +199,44 @@ def resolve_startup_skills(profile_root: Path | str, names: Iterable[str]) -> tu
                         )
                     except OSError:
                         _fail("cannot securely inspect startup skill path")
+                    fallback = relative_parts[-1] if relative_parts else "skills"
                     if stat.S_ISLNK(info.st_mode):
-                        _fail("symlinks are not allowed below the profile skills root")
+                        if entry_name == "SKILL.md" and fallback in wanted:
+                            _fail("startup skill symlinks are not allowed")
+                        continue
                     if stat.S_ISDIR(info.st_mode):
-                        _require_owned_restrictive(info, "startup skill ancestor")
                         try:
                             child_fd = os.open(entry_name, directory_flags, dir_fd=directory_fd)
                         except OSError:
-                            _fail("cannot securely open startup skill ancestor")
-                        opened_child = os.fstat(child_fd)
+                            continue
+                        try:
+                            opened_child = os.fstat(child_fd)
+                        except OSError:
+                            os.close(child_fd)
+                            continue
                         if (opened_child.st_dev, opened_child.st_ino) != (info.st_dev, info.st_ino):
                             os.close(child_fd)
-                            _fail("startup skill ancestor changed during discovery")
-                        stack.append((child_fd, (*relative_parts, entry_name)))
+                            continue
+                        stack.append(
+                            (
+                                child_fd,
+                                (*relative_parts, entry_name),
+                                (*ancestor_infos, opened_child),
+                            )
+                        )
                         continue
                     if entry_name != "SKILL.md":
                         continue
+                    probed_name = _probe_frontmatter_name_at(
+                        directory_fd, entry_name, fallback
+                    )
+                    if probed_name not in wanted:
+                        continue
+                    for ancestor_info in ancestor_infos:
+                        _require_owned_restrictive(
+                            ancestor_info, "startup skill ancestor"
+                        )
                     data = _read_regular_file_at(directory_fd, entry_name)
-                    fallback = relative_parts[-1] if relative_parts else "skills"
                     resolved_name = _frontmatter_name(data, fallback)
                     if resolved_name not in wanted:
                         continue
@@ -187,6 +256,8 @@ def resolve_startup_skills(profile_root: Path | str, names: Iterable[str]) -> tu
             finally:
                 os.close(directory_fd)
     finally:
+        for pending_fd, _relative_parts, _ancestor_infos in stack:
+            os.close(pending_fd)
         if root_fd >= 0:
             os.close(root_fd)
         os.close(profile_fd)
