@@ -1130,6 +1130,13 @@ def test_agent_definitions_rpc_returns_allowlisted_projection(monkeypatch, tmp_p
 
     agents = tmp_path / "agents"
     agents.mkdir()
+    skill = tmp_path / "skills" / "grounded-citations"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\nname: grounded-citations\ndescription: Cite sources\n---\n"
+        "SECRET STARTUP SKILL BODY MUST NOT LEAK\n",
+        encoding="utf-8",
+    )
     (agents / "researcher.md").write_text(
         "---\n"
         "name: researcher\n"
@@ -1140,6 +1147,7 @@ def test_agent_definitions_rpc_returns_allowlisted_projection(monkeypatch, tmp_p
         "fallbacks:\n"
         "  - provider: provider-b\n"
         "    model: model-b\n"
+        "skills: [grounded-citations]\n"
         "---\n"
         "SECRET BODY MUST NOT LEAK\n"
     )
@@ -1175,12 +1183,13 @@ def test_agent_definitions_rpc_returns_allowlisted_projection(monkeypatch, tmp_p
             "fallback_count": 1,
             "tools_allow": None,
             "mcp_allow": None,
-            "skills": [],
+            "skills": ["grounded-citations"],
             "relative_path": "researcher.md",
             "digest": payload["definitions"][0]["digest"],
         }
     ]
     assert "SECRET BODY" not in str(payload)
+    assert "SECRET STARTUP SKILL BODY" not in str(payload)
     assert str(tmp_path) not in str(payload)
 
 
