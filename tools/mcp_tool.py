@@ -7183,6 +7183,8 @@ def refresh_agent_mcp_tools(
         or []
     )
     exact_allowlist = getattr(agent, "_exact_tool_allowlist", None)
+    raw_authority_names = None
+    exact_mcp_owners = None
     if exact_allowlist is not None:
         from tools.tool_search import assemble_tool_defs
 
@@ -7220,7 +7222,33 @@ def refresh_agent_mcp_tools(
             for name in exact_allowlist
             if name not in authorized_mcp_owners or name in surviving_raw_names
         )
+        raw_authority_names = set(exact_allowlist)
+        exact_mcp_owners = {
+            name: owner
+            for name, owner in authorized_mcp_owners.items()
+            if name in raw_authority_names
+        }
         new_defs = assemble_tool_defs(raw_defs).tool_defs
+    else:
+        raw_defs = list(
+            get_tool_definitions(
+                enabled_toolsets=enabled,
+                disabled_toolsets=disabled,
+                quiet_mode=quiet_mode,
+                skip_tool_search_assembly=True,
+            )
+            or []
+        )
+        raw_authority_names = {
+            name
+            for tool in raw_defs
+            if isinstance(name := (tool.get("function") or {}).get("name"), str)
+        }
+        exact_mcp_owners = {
+            name: owner
+            for name in raw_authority_names
+            if (owner := get_mcp_server_for_tool(name)) is not None
+        }
     new_names = {t["function"]["name"] for t in new_defs}
     authority_names = (
         set(exact_allowlist) | new_names
@@ -7260,14 +7288,26 @@ def refresh_agent_mcp_tools(
             for t in (getattr(agent, "tools", None) or [])
         }
         current_authority = set(getattr(agent, "valid_tool_names", ()) or ())
-        if new_names == current and authority_names == current_authority:
+        current_raw_authority = set(
+            getattr(agent, "_raw_authorized_tool_names", ()) or ()
+        )
+        current_mcp_owners = dict(
+            getattr(agent, "_exact_mcp_tool_owners", {}) or {}
+        )
+        if (
+            new_names == current
+            and authority_names == current_authority
+            and raw_authority_names == current_raw_authority
+            and exact_mcp_owners == current_mcp_owners
+        ):
             # No change → leave the live snapshot untouched (no churn), but
             # record the generation so an in-flight older caller can't clobber.
             agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
             return set()
         agent.tools = new_defs
         agent.valid_tool_names = authority_names
-        agent._raw_authorized_tool_names = set(authority_names)
+        agent._raw_authorized_tool_names = raw_authority_names
+        agent._exact_mcp_tool_owners = exact_mcp_owners
         # Publish context-engine routing names atomically with the snapshot.
         engine_names = getattr(agent, "_context_engine_tool_names", None)
         if isinstance(engine_names, set):

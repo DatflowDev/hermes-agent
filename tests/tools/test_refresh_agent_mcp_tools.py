@@ -44,6 +44,44 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert len(agent.tools) == 3
 
 
+def test_refresh_preserves_raw_authority_behind_tool_search_bridges(monkeypatch):
+    """Late MCP tools may defer behind bridges but remain delegation authority."""
+    agent = _agent(["tool_search", "tool_describe", "tool_call"])
+    agent._raw_authorized_tool_names = {
+        "tool_search",
+        "tool_describe",
+        "tool_call",
+        "read_file",
+    }
+
+    assembled = [_tool(name) for name in ("tool_search", "tool_describe", "tool_call")]
+    raw = [_tool(name) for name in ("read_file", "mcp__codegraph__explore")]
+
+    import model_tools
+
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **kw: raw if kw.get("skip_tool_search_assembly") else assembled,
+    )
+    monkeypatch.setattr(
+        mcp_tool,
+        "get_mcp_server_for_tool",
+        lambda name: "codegraph" if name == "mcp__codegraph__explore" else None,
+    )
+
+    mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert agent.valid_tool_names == {"tool_search", "tool_describe", "tool_call"}
+    assert agent._raw_authorized_tool_names == {
+        "read_file",
+        "mcp__codegraph__explore",
+    }
+    assert agent._exact_mcp_tool_owners == {
+        "mcp__codegraph__explore": "codegraph"
+    }
+
+
 def test_refresh_cannot_expand_an_exact_agent_allowlist(monkeypatch):
     agent = _agent(["read_file"])
     agent._exact_tool_allowlist = frozenset({"read_file"})
