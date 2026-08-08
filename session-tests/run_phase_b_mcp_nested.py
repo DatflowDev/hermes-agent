@@ -347,7 +347,10 @@ def main() -> int:
             patch("tools.delegate_tool._build_child_preserving_parent_tools") as build_mock,
         ):
             batch_result = json.loads(delegate_task(
-                tasks=[{"goal": "First", "agent_name": "first"}, {"goal": "Second", "agent_name": "second"}],
+                tasks=[
+                    {"goal": "Run first route", "agent_name": "first"},
+                    {"goal": "Run second route", "agent_name": "second"},
+                ],
                 parent_agent=p8,
             ))
         row(rows, "NEST-08", "AGENT_ROUTE_UNAVAILABLE" in batch_result.get("error", "") and build_mock.call_count == 0,

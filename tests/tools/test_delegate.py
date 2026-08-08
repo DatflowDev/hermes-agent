@@ -742,8 +742,8 @@ class TestDelegateTask(unittest.TestCase):
             result = json.loads(
                 delegate_task(
                     tasks=[
-                        {"goal": "First", "agent_name": "first"},
-                        {"goal": "Second", "agent_name": "second"},
+                        {"goal": "Run first route", "agent_name": "first"},
+                        {"goal": "Run second route", "agent_name": "second"},
                     ],
                     parent_agent=parent,
                 )
