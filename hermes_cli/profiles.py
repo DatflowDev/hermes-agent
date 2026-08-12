@@ -79,6 +79,7 @@ _CLONE_ALL_STRIP: list[str] = [
     "gateway.pid",
     "gateway_state.json",
     "processes.json",
+    ".agent-catalog-signing-key",
 ]
 
 # Infrastructure artifacts excluded from --clone-all when the source is the
@@ -245,7 +246,7 @@ _DEFAULT_EXPORT_INCLUDE_ROOT = frozenset({
     # profile export; applied by its import — see desktop.json handling).
     "desktop.json",
     # User-facing skill, cron, and session artifacts
-    "skills", "cron", "scripts", "sessions",
+    "skills", "agents", "cron", "scripts", "sessions",
     # Plugin / memory surfaces (per-profile overrides live here)
     "plugins", "memories", "knowledge", "preferences",
 })
@@ -2079,7 +2080,9 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     # Named profiles — stage a filtered copy to exclude credentials
     with tempfile.TemporaryDirectory() as tmpdir:
         staged = Path(tmpdir) / canon
-        _CREDENTIAL_FILES = {"auth.json", ".env"}
+        _CREDENTIAL_FILES = {
+            "auth.json", ".env", ".agent-catalog-signing-key",
+        }
         shutil.copytree(
             profile_dir,
             staged,
@@ -2228,6 +2231,10 @@ def import_profile(archive_path: str, name: Optional[str] = None) -> Path:
             extracted.rename(final_source)
 
         shutil.move(str(final_source), str(profile_dir))
+
+    # Catalog authentication belongs to the destination profile. Imported
+    # definitions are preserved, but any source-profile signing key is not.
+    (profile_dir / ".agent-catalog-signing-key").unlink(missing_ok=True)
 
     return profile_dir
 

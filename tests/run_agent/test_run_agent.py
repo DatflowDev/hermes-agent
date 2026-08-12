@@ -1939,6 +1939,7 @@ class TestConcurrentToolExecution:
                 turn_id="",
                 api_request_id="",
                 enabled_tools=list(agent.valid_tool_names),
+                authorized_mcp_owners={},
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
                 enabled_toolsets=agent.enabled_toolsets,
@@ -1946,6 +1947,45 @@ class TestConcurrentToolExecution:
                 tool_request_middleware_trace=[],
             )
             assert result == "result"
+
+    def test_invoke_tool_preserves_pre_deferred_execution_authority(self, agent):
+        """MCP tools hidden behind tool_search remain callable by the bridge."""
+        agent.valid_tool_names.add("tool_describe")
+        agent._raw_authorized_tool_names = {"mcp__context7__query_docs"}
+
+        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
+            agent._invoke_tool(
+                "tool_describe",
+                {"name": "mcp__context7__query_docs"},
+                "task-1",
+            )
+
+        enabled = set(mock_hfc.call_args.kwargs["enabled_tools"])
+        assert agent.valid_tool_names <= enabled
+        assert "mcp__context7__query_docs" in enabled
+
+    def test_sequential_tool_search_bridge_preserves_pre_deferred_execution_authority(
+        self, agent
+    ):
+        """Sequential bridge dispatch retains the same hidden MCP authority."""
+        agent.valid_tool_names.add("tool_describe")
+        agent._raw_authorized_tool_names = {"mcp__context7__query_docs"}
+        tool_call = _mock_tool_call(
+            name="tool_describe",
+            arguments='{"name":"mcp__context7__query_docs"}',
+            call_id="c1",
+        )
+
+        with patch("run_agent.handle_function_call", return_value="result") as mock_hfc:
+            agent._execute_tool_calls_sequential(
+                _mock_assistant_msg(content="", tool_calls=[tool_call]),
+                [],
+                "task-1",
+            )
+
+        enabled = set(mock_hfc.call_args.kwargs["enabled_tools"])
+        assert agent.valid_tool_names <= enabled
+        assert "mcp__context7__query_docs" in enabled
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
@@ -2039,6 +2079,7 @@ class TestConcurrentToolExecution:
 
     def test_invoke_tool_handles_agent_level_tools(self, agent):
         """_invoke_tool should handle todo tool directly."""
+        agent.valid_tool_names.add("todo")
         with patch("tools.todo_tool.todo_tool", return_value='{"ok":true}') as mock_todo:
             result = agent._invoke_tool("todo", {"todos": []}, "task-1")
             mock_todo.assert_called_once()
@@ -2145,6 +2186,7 @@ class TestConcurrentToolExecution:
     def test_blocked_memory_tool_does_not_reset_counter(self, agent, monkeypatch):
         """Blocked memory tool should not reset the nudge counter."""
         agent._turns_since_memory = 5
+        agent.valid_tool_names.add("memory")
         monkeypatch.setattr(
             "hermes_cli.plugins.resolve_pre_tool_block",
             lambda *args, **kwargs: "Blocked",
@@ -2339,6 +2381,7 @@ class TestAgentRuntimePostHookOwnershipSync:
             lambda args: '{"ok":true}',
         )
         agent._memory_manager = None
+        agent.valid_tool_names.add(tool_name)
 
         assert tool_name in AGENT_RUNTIME_POST_HOOK_TOOL_NAMES
         with patch(

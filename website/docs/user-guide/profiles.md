@@ -6,6 +6,8 @@ sidebar_position: 2
 
 Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state.
 
+Profiles may also own reusable Markdown subagent definitions in `agents/`. See [Profile agents](./features/profile-agents.md) for the file schema, catalog pinning, launch surfaces, and clone/import/export behavior.
+
 ## What are profiles?
 
 A profile is a separate Hermes home directory. Each profile gets its own directory containing its own `config.yaml`, `.env`, `SOUL.md`, memories, sessions, skills, cron jobs, and state database. Profiles let you run separate agents for different purposes — a coding assistant, a personal bot, a research agent — without mixing up Hermes state.

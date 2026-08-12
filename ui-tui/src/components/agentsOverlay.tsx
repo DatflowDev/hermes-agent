@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 import { Box, NoSelect, ScrollBox, type ScrollBoxHandle, Text, useInput, useStdout } from '@hermes/ink'
 import { useStore } from '@nanostores/react'
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
@@ -12,7 +14,13 @@ import { patchOverlayState } from '../app/overlayStore.js'
 import { $spawnDiff, $spawnHistory, clearDiffPair, type SpawnSnapshot } from '../app/spawnHistoryStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import type { DelegationPauseResponse, DelegationStatusResponse, SubagentInterruptResponse } from '../gatewayTypes.js'
+import type {
+  AgentDefinitionProjection,
+  AgentDefinitionsResponse,
+  DelegationPauseResponse,
+  DelegationStatusResponse,
+  SubagentInterruptResponse
+} from '../gatewayTypes.js'
 import { asRpcResult } from '../lib/rpc.js'
 import {
   buildSubagentTree,
@@ -34,6 +42,7 @@ import type { SubagentNode, SubagentProgress } from '../types.js'
 
 import { listRowStyle } from './overlayPrimitives.js'
 import { OverlayScrollbar } from './overlayScrollbar.js'
+import { TextInput } from './textInput.js'
 
 // ── Types + lookup tables ────────────────────────────────────────────
 
@@ -43,6 +52,28 @@ type Status = SubagentProgress['status']
 
 const SORT_ORDER: readonly SortMode[] = ['depth-first', 'tools-desc', 'duration-desc', 'status']
 const FILTER_ORDER: readonly FilterMode[] = ['all', 'running', 'failed', 'leaf']
+
+export const definitionWindow = (cursor: number, terminalRows: number, count: number) => {
+  const visible = Math.max(1, Math.floor(terminalRows / 4))
+  const start = Math.max(0, Math.min(cursor - Math.floor(visible / 2), Math.max(0, count - visible)))
+
+  return { start, visible }
+}
+
+export const agentDefinitionLaunchParams = (
+  definition: AgentDefinitionProjection,
+  revision: string,
+  sessionId: string,
+  task: string,
+  requestId: string
+) => ({
+  definition_id: definition.definition_id,
+  digest: definition.digest,
+  request_id: requestId,
+  revision,
+  session_id: sessionId,
+  task
+})
 
 const SORT_LABEL: Record<SortMode, string> = {
   'depth-first': 'spawn order',
@@ -594,7 +625,7 @@ function DiffView({
 
 // ── Main overlay ─────────────────────────────────────────────────────
 
-export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: AgentsOverlayProps) {
+export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, sessionId, t }: AgentsOverlayProps) {
   const liveSubagents = useTurnSelector(state => state.subagents)
   const delegation = useStore($delegationState)
   const history = useStore($spawnHistory)
@@ -615,6 +646,14 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
   // cc-style view switching: list = full-width row picker, detail = full-width
   // scrollable pane.  Two panes side-by-side in Ink fought Yoga flex.
   const [mode, setMode] = useState<'detail' | 'list'>('list')
+  const [surface, setSurface] = useState<'definitions' | 'runs'>('runs')
+  const [definitions, setDefinitions] = useState<AgentDefinitionProjection[]>([])
+  const [definitionsError, setDefinitionsError] = useState('')
+  const [definitionsRevision, setDefinitionsRevision] = useState('')
+  const [definitionCursor, setDefinitionCursor] = useState(0)
+  const [definitionTask, setDefinitionTask] = useState('')
+  const [definitionEditing, setDefinitionEditing] = useState(false)
+  const [definitionLaunching, setDefinitionLaunching] = useState(false)
 
   const detailScrollRef = useRef<null | ScrollBoxHandle>(null)
   const prevLiveCountRef = useRef(liveSubagents.length)
@@ -641,6 +680,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
   const cols = stdout?.columns ?? 80
   const rowsH = Math.max(8, (stdout?.rows ?? 24) - 10)
   const listWindowStart = Math.max(0, cursor - Math.floor(rowsH / 2))
+  const definitionsWindow = definitionWindow(definitionCursor, rowsH, definitions.length)
 
   // ── Effects ────────────────────────────────────────────────────────
 
@@ -685,6 +725,23 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
       .then(r => applyDelegationStatus(asRpcResult<DelegationStatusResponse>(r)))
       .catch(() => {})
   }, [gw])
+
+  useEffect(() => {
+    gw.request<AgentDefinitionsResponse>('agent_definitions.list', sessionId ? { session_id: sessionId } : {})
+      .then(raw => {
+        const result = asRpcResult<AgentDefinitionsResponse>(raw)
+        setDefinitions(result?.definitions ?? [])
+        setDefinitionsRevision(result?.revision ?? '')
+        setDefinitionsError('')
+      })
+      .catch(error => setDefinitionsError(error instanceof Error ? error.message : String(error)))
+  }, [gw, sessionId])
+
+  useEffect(() => {
+    if (definitionCursor >= definitions.length) {
+      setDefinitionCursor(Math.max(0, definitions.length - 1))
+    }
+  }, [definitionCursor, definitions.length])
 
   useEffect(() => {
     if (cursor >= rows.length) {
@@ -732,6 +789,28 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
         .catch(() => setFlash('pause failed'))
     })
 
+  const launchDefinition = (taskValue: string) => {
+    const definition = definitions[definitionCursor]
+    const task = taskValue.trim()
+
+    if (!sessionId || !definition || !definitionsRevision || !task || definitionLaunching) {
+      return
+    }
+
+    setDefinitionLaunching(true)
+    gw.request(
+      'agent_definitions.launch',
+      agentDefinitionLaunchParams(definition, definitionsRevision, sessionId, task, randomUUID())
+    )
+      .then(() => {
+        setFlash(`${definition.name} launched`)
+        setDefinitionTask('')
+        setDefinitionEditing(false)
+      })
+      .catch(error => setFlash(`launch failed: ${error instanceof Error ? error.message : String(error)}`))
+      .finally(() => setDefinitionLaunching(false))
+  }
+
   const stepHistory = (delta: -1 | 1) =>
     setHistoryIndex(idx => {
       const next = Math.max(0, Math.min(history.length, idx + delta))
@@ -756,12 +835,38 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
   const scrollDetail = (dy: number) => detailScrollRef.current?.scrollBy(dy)
 
   useInput((ch, key) => {
+    if (surface === 'definitions' && definitionEditing) {
+      if (key.escape) {
+        setDefinitionEditing(false)
+      }
+
+      return
+    }
+
     if (ch === 'q') {
       return closeWithCleanup()
     }
 
     if (key.escape) {
-      return mode === 'detail' ? setMode('list') : closeWithCleanup()
+      return mode === 'detail' && surface === 'runs' ? setMode('list') : closeWithCleanup()
+    }
+
+    if (ch === 'd') {
+      setSurface(value => (value === 'runs' ? 'definitions' : 'runs'))
+
+      return
+    }
+
+    if (surface === 'definitions') {
+      if (key.upArrow || ch === 'k') {
+        setDefinitionCursor(value => Math.max(0, value - 1))
+      } else if (key.downArrow || ch === 'j') {
+        setDefinitionCursor(value => Math.min(Math.max(0, definitions.length - 1), value + 1))
+      } else if (key.return && definitions.length > 0 && sessionId) {
+        setDefinitionEditing(true)
+      }
+
+      return
     }
 
     // Shared actions (both modes).
@@ -907,9 +1012,44 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
             </Text>
           ) : null}
         </Text>
+        <Text color={t.color.muted}>
+          {surface === 'runs' ? 'Runs' : 'Definitions'} · d switch
+        </Text>
       </Box>
 
-      {rows.length === 0 ? (
+      {surface === 'definitions' ? (
+        <Box flexDirection="column" flexGrow={1}>
+          {definitionsError ? <Text color={t.color.error}>{definitionsError}</Text> : null}
+          {definitions.length === 0 && !definitionsError ? (
+            <Text color={t.color.muted}>No profile agent definitions.</Text>
+          ) : (
+            definitions
+              .slice(definitionsWindow.start, definitionsWindow.start + definitionsWindow.visible)
+              .map((definition, visibleIndex) => {
+                const index = definitionsWindow.start + visibleIndex
+
+                return (
+                  <Box flexDirection="column" key={`${definition.name}:${definition.digest}`} marginBottom={1}>
+                    <Text bold color={index === definitionCursor ? t.color.accent : t.color.primary}>
+                      {index === definitionCursor ? '› ' : '  '}
+                      {definition.name}
+                    </Text>
+                    <Text color={t.color.text}>{definition.description}</Text>
+                    <Text color={t.color.muted}>
+                      {definition.identity} · {definition.provider ?? 'inherit'} / {definition.model ?? 'inherit'} ·{' '}
+                      {definition.fallback_count} fallback{definition.fallback_count === 1 ? '' : 's'} ·{' '}
+                      {definition.relative_path}
+                    </Text>
+                    <Text color={t.color.muted}>
+                      tools: {definition.tools_allow?.join(', ') ?? 'inherit'} · MCP:{' '}
+                      {definition.mcp_allow?.join(', ') ?? 'inherit'}
+                    </Text>
+                  </Box>
+                )
+              })
+          )}
+        </Box>
+      ) : rows.length === 0 ? (
         <Box flexDirection="column" flexGrow={1}>
           <Text color={t.color.muted}>No subagents this turn. Trigger delegate_task to populate the tree.</Text>
         </Box>
@@ -948,7 +1088,28 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
       <Box flexDirection="column" marginTop={1}>
         {flash ? <Text color={t.color.accent}>{flash}</Text> : null}
 
-        {mode === 'list' ? (
+        {surface === 'definitions' ? (
+          definitionEditing ? (
+            <Box flexDirection="column">
+              <Text color={t.color.muted}>
+                Task for {definitions[definitionCursor]?.name} · Enter launch · Esc cancel
+              </Text>
+              <TextInput
+                color={t.color.text}
+                focus
+                onChange={setDefinitionTask}
+                onSubmit={launchDefinition}
+                placeholder="Describe the task"
+                placeholderColor={t.color.muted}
+                value={definitionTask}
+              />
+            </Box>
+          ) : (
+            <Text color={t.color.muted}>
+              ↑↓/jk move · Enter task{!sessionId ? ' (session unavailable)' : ''} · d runs · q close
+            </Text>
+          )
+        ) : mode === 'list' ? (
           <Text color={t.color.muted}>
             ↑↓/jk move · g/G top/bottom · Enter/→ open detail{controlsHint} · s sort:{SORT_LABEL[sort]} · f filter:
             {FILTER_LABEL[filter]}
@@ -969,6 +1130,7 @@ interface AgentsOverlayProps {
   gw: GatewayClient
   initialHistoryIndex?: number
   onClose: () => void
+  sessionId?: string | null
   t: Theme
 }
 

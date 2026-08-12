@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import re
@@ -26,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse, urlunparse
@@ -519,12 +521,14 @@ def init_agent(
     gateway_session_key: str = None,
     skip_context_files: bool = False,
     load_soul_identity: bool = False,
+    identity_override: Optional[str] = None,
+    agent_catalog: Any = None,
     skip_memory: bool = False,
     skip_background_review: bool = False,
     session_db=None,
     parent_session_id: str = None,
     iteration_budget: "IterationBudget" = None,
-    fallback_model: Dict[str, Any] = None,
+    fallback_model: Any = None,
     credential_pool=None,
     checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20,
@@ -581,6 +585,10 @@ def init_agent(
         load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
+        identity_override (str): Immutable replacement persona for a file-defined
+            child agent. Replaces SOUL/default identity but not Hermes guidance.
+        agent_catalog: Optional conversation-pinned profile agent catalog inherited
+            by delegated children before their tool schema is built.
     """
     _install_safe_stdio()
 
@@ -619,6 +627,14 @@ def init_agent(
     # skip_memory=True already disables the memory-review trigger; this
     # flag is the explicit single-switch off for both review paths.
     agent.skip_background_review = bool(skip_background_review)
+    agent.identity_override = identity_override
+    # Populated by file-defined profile-mode child construction. Kept on the
+    # agent so compression, restore, and fallback rebuild paths receive the
+    # same cached system_message bytes.
+    agent._agent_definition_system_message = None
+    agent._agent_definition_metadata = None
+    agent._agent_launch_request_ids = OrderedDict()
+    agent._agent_launch_request_lock = threading.Lock()
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
@@ -1441,6 +1457,24 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # Capture profile-defined agents once per root conversation. Delegated
+    # children inherit the parent's pinned catalog; they must not rescan an
+    # ambient profile home because context-local profile state can differ by
+    # thread.
+    from agent.agent_definitions import AgentCatalog, discover_profile_agents
+
+    if agent_catalog is not None:
+        agent._agent_catalog = agent_catalog
+    elif parent_session_id is None:
+        agent._agent_catalog = discover_profile_agents(get_hermes_home())
+    else:
+        empty_root = get_hermes_home()
+        agent._agent_catalog = AgentCatalog(
+            empty_root,
+            empty_root / "agents",
+            (),
+            hashlib.sha256(b"").hexdigest(),
+        )
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
     # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
@@ -1454,6 +1488,68 @@ def init_agent(
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
     )
+    # Preserve the exact pre-deferred registry authority. ``agent.tools`` may
+    # contain only bridge schemas after tool-search assembly, while delegated
+    # children still need a non-widening intersection with underlying names.
+    try:
+        agent._raw_authorized_tool_names = {
+            name
+            for tool in _ra().get_tool_definitions(
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                quiet_mode=True,
+                skip_tool_search_assembly=True,
+            )
+            if isinstance(name := (tool.get("function") or {}).get("name"), str)
+        }
+    except Exception:
+        agent._raw_authorized_tool_names = set()
+    try:
+        from tools.mcp_tool import get_mcp_server_for_tool
+
+        agent._exact_mcp_tool_owners = {
+            name: owner
+            for name in agent._raw_authorized_tool_names
+            if (owner := get_mcp_server_for_tool(name)) is not None
+        }
+    except Exception:
+        # Fail closed for provenance-dependent authority. A later exact child
+        # cannot inherit an MCP owner that was not captured here.
+        agent._exact_mcp_tool_owners = {}
+    if agent.tools and agent._agent_catalog.entries:
+        catalog_names = [
+            entry.definition.name for entry in agent._agent_catalog.entries
+        ]
+        catalog_description = (
+            "Select one immutable profile-defined agent by canonical name. "
+            "Available definitions:\n"
+            + "\n".join(
+                f"- {entry.definition.name}: {entry.definition.description}"
+                for entry in agent._agent_catalog.entries
+            )
+        )
+        for tool in agent.tools:
+            function = tool.get("function", {})
+            if function.get("name") != "delegate_task":
+                continue
+            properties = function.setdefault("parameters", {}).setdefault(
+                "properties", {}
+            )
+            properties["agent_name"] = {
+                "type": "string",
+                "enum": catalog_names,
+                "description": catalog_description,
+            }
+            task_properties = (
+                properties.get("tasks", {})
+                .get("items", {})
+                .setdefault("properties", {})
+            )
+            task_properties["agent_name"] = {
+                "type": "string",
+                "enum": catalog_names,
+                "description": "Per-task profile-defined agent selection.",
+            }
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1622,6 +1718,12 @@ def init_agent(
         "reasoning_config": reasoning_config,
         "max_tokens": max_tokens,
     }
+    from agent.agent_definitions import AgentCatalog, snapshot_agent_catalog
+
+    if isinstance(agent._agent_catalog, AgentCatalog):
+        agent._session_init_model_config["agent_catalog"] = snapshot_agent_catalog(
+            agent._agent_catalog
+        )
     # Persist a process-scoped --yolo launch into the session row so a later
     # `hermes --resume <id>` can restore the bypass (CLI resume paths read
     # model_config.yolo_mode back via SessionDB.session_yolo_enabled).

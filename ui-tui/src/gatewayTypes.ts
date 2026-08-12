@@ -568,6 +568,26 @@ export interface DelegationStatusResponse {
   paused?: boolean
 }
 
+export interface AgentDefinitionProjection {
+  definition_id: string
+  description: string
+  digest: string
+  fallback_count: number
+  identity: 'profile' | 'replace'
+  model: null | string
+  tools_allow: null | string[]
+  mcp_allow: null | string[]
+  name: string
+  provider: null | string
+  relative_path: string
+}
+
+export interface AgentDefinitionsResponse {
+  definitions: AgentDefinitionProjection[]
+  revision: string
+  version: number
+}
+
 export interface DelegationPauseResponse {
   paused?: boolean
 }

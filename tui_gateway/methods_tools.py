@@ -11,6 +11,74 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _reserve_agent_launch(
+    profile_home, session_id: str, definition_id: str, digest: str,
+    revision: str, request_id: str,
+) -> bool:
+    """Durably reserve a launch request; return False for any replay."""
+    import sqlite3
+    import time
+    from pathlib import Path
+
+    root = Path(profile_home)
+    root.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(root / "state.db", timeout=20.0)
+    try:
+        connection.execute("PRAGMA busy_timeout=20000")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_definition_launches (
+                session_id TEXT NOT NULL,
+                definition_id TEXT NOT NULL,
+                digest TEXT NOT NULL,
+                revision TEXT NOT NULL,
+                request_id TEXT NOT NULL,
+                reserved_at REAL NOT NULL,
+                PRIMARY KEY (
+                    session_id, definition_id, digest, revision, request_id
+                )
+            )
+            """
+        )
+        # Older development snapshots keyed uniqueness by definition metadata,
+        # allowing the same session/request pair to be reused after a catalog
+        # change. Collapse any such historical duplicates before installing the
+        # durable request identity used by all current launches.
+        connection.execute(
+            """
+            DELETE FROM agent_definition_launches
+            WHERE rowid NOT IN (
+                SELECT MIN(rowid)
+                FROM agent_definition_launches
+                GROUP BY session_id, request_id
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                agent_definition_launch_request_identity
+            ON agent_definition_launches (session_id, request_id)
+            """
+        )
+        try:
+            connection.execute(
+                """
+                INSERT INTO agent_definition_launches (
+                    session_id, definition_id, digest, revision,
+                    request_id, reserved_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (session_id, definition_id, digest, revision, request_id, time.time()),
+            )
+            connection.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    finally:
+        connection.close()
+
+
 @method("system.battery")
 def _(rid, params: dict) -> dict:
     """Return the host battery status for the status-bar read-out.
@@ -1624,6 +1692,131 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _err(rid, 5033, str(e))
+
+
+@method("agent_definitions.list")
+def _(rid, params: dict) -> dict:
+    """Return the conversation-pinned allowlisted agent catalog projection."""
+    try:
+        session, err = _sess(params, rid)
+        if err:
+            return err
+        agent = session.get("agent")
+        if agent is None:
+            return _err(rid, 4001, "session agent unavailable")
+        catalog = getattr(agent, "_agent_catalog", None)
+        if catalog is None:
+            return _err(rid, 4001, "session agent catalog unavailable")
+        return _ok(rid, catalog.project())
+    except Exception as exc:
+        code = getattr(exc, "code", "AGENT_DEFINITION_INVALID")
+        return _err(rid, 5034, f"{code}: {exc}")
+
+
+@method("agent_definitions.launch")
+def _(rid, params: dict) -> dict:
+    """Launch one exact pinned definition through the native delegation runtime."""
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    agent = session.get("agent")
+    if agent is None:
+        return _err(rid, 4001, "session agent unavailable")
+
+    definition_id = str(params.get("definition_id") or "")
+    digest = str(params.get("digest") or "")
+    revision = str(params.get("revision") or "")
+    request_id = str(params.get("request_id") or "")
+    task = str(params.get("task") or "").strip()
+    if not all((definition_id, digest, revision, request_id, task)):
+        return _err(rid, 4000, "definition_id, digest, revision, request_id and task are required")
+    if len(request_id) > 128 or len(task) > 20_000:
+        return _err(rid, 4000, "launch request exceeds its limit")
+
+    catalog = getattr(agent, "_agent_catalog", None)
+    if catalog is None or catalog.revision != revision:
+        return _err(rid, 4090, "STALE_AGENT_DEFINITION: catalog revision changed")
+    entry = catalog.get_by_id(definition_id)
+    if entry is None or entry.definition.full_digest != digest:
+        return _err(rid, 4090, "STALE_AGENT_DEFINITION: definition identity changed")
+
+    import time
+
+    profile_home = session.get("profile_home")
+    home_token = None
+    secret_token = None
+    if profile_home:
+        from pathlib import Path
+
+        home_token = set_hermes_home_override(profile_home)
+        secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
+
+    try:
+        launch_lock = getattr(agent, "_agent_launch_request_lock", None)
+        if launch_lock is None:
+            return _err(rid, 5000, "agent launch replay guard unavailable")
+        with launch_lock:
+            consumed = getattr(agent, "_agent_launch_request_ids", None)
+            if consumed is None or not hasattr(consumed, "move_to_end"):
+                return _err(rid, 5000, "agent launch replay cache unavailable")
+            now = time.monotonic()
+            while consumed:
+                oldest_id, oldest_at = next(iter(consumed.items()))
+                if len(consumed) <= 1024 and now - oldest_at <= 3600:
+                    break
+                consumed.pop(oldest_id, None)
+            if request_id in consumed:
+                return _err(rid, 4091, "AGENT_LAUNCH_REPLAY: request_id already consumed")
+            durable_home = profile_home or catalog.profile_root
+            from tui_gateway.methods_tools import _reserve_agent_launch
+
+            if not _reserve_agent_launch(
+                durable_home,
+                str(params.get("session_id") or ""),
+                definition_id,
+                digest,
+                revision,
+                request_id,
+            ):
+                return _err(rid, 4091, "AGENT_LAUNCH_REPLAY: request_id already consumed")
+            consumed[request_id] = now
+
+        try:
+            import json
+            from tools.delegate_tool import delegate_task
+
+            result = json.loads(
+                delegate_task(
+                    goal=task,
+                    agent_name=entry.definition.name,
+                    background=True,
+                    parent_agent=agent,
+                )
+            )
+            if not isinstance(result, dict):
+                return _err(rid, 5000, "agent definition launch returned an invalid response")
+            if result.get("error"):
+                return _err(rid, 5000, f"agent definition launch failed: {result['error']}")
+            status = str(result.get("status") or "")
+            if status not in {"dispatched", "completed"}:
+                return _err(rid, 5000, f"agent definition launch failed with status: {status or 'unknown'}")
+            return _ok(
+                rid,
+                {
+                    "status": status,
+                    "definition_id": definition_id,
+                    "definition_name": entry.definition.name,
+                    "request_id": request_id,
+                    "delegation": result,
+                },
+            )
+        except Exception as exc:
+            return _err(rid, 5000, f"agent definition launch failed: {exc}")
+    finally:
+        if home_token is not None:
+            reset_hermes_home_override(home_token)
+        if secret_token is not None:
+            reset_secret_scope(secret_token)
 
 
 @method("cron.manage")

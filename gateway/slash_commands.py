@@ -1201,6 +1201,52 @@ class GatewaySlashCommandsMixin:
 
         now = time.time()
         current_session_key = self._session_key_for_source(event.source)
+        args = event.get_command_args().strip()
+        if args:
+            agent = self._running_agents.get(current_session_key)
+            if not agent or agent is _AGENT_PENDING_SENTINEL:
+                cache_lock = getattr(self, "_agent_cache_lock", None)
+                cache = getattr(self, "_agent_cache", None)
+                if cache_lock is not None and cache is not None:
+                    with cache_lock:
+                        cached = cache.get(current_session_key)
+                    if cached:
+                        agent = cached[0]
+            catalog = getattr(agent, "_agent_catalog", None) if agent else None
+            if args == "definitions":
+                entries = getattr(catalog, "entries", ()) if catalog else ()
+                if not entries:
+                    return "No profile agent definitions."
+                lines = [f"Profile agent definitions ({len(entries)}):"]
+                for entry in entries:
+                    definition = entry.definition
+                    lines.append(
+                        f"- `{definition.name}` [{definition.identity}] — "
+                        f"{definition.description}"
+                    )
+                return "\n".join(lines)
+            if args.startswith("show "):
+                name = args[5:].strip()
+                entry = catalog.get(name) if catalog else None
+                if entry is None:
+                    return f"Agent definition not found: {name}"
+                definition = entry.definition
+                tools = (
+                    "inherit" if definition.tools_allow is None
+                    else ", ".join(definition.tools_allow) or "none"
+                )
+                mcp = (
+                    "inherit" if definition.mcp_allow is None
+                    else ", ".join(definition.mcp_allow) or "none"
+                )
+                return (
+                    f"`{definition.name}` [{definition.identity}]\n"
+                    f"{definition.description}\n"
+                    f"Source: `{definition.relative_path}`\n"
+                    f"Digest: `{definition.full_digest}`\n"
+                    f"Tools: {tools}\nMCP: {mcp}"
+                )
+            return "Usage: /agents [definitions|show <name>]"
 
         running_agents: dict = getattr(self, "_running_agents", {}) or {}
         running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
