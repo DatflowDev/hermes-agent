@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 import os
 import threading
 import time
+import weakref
 from concurrent.futures import (
     TimeoutError as FuturesTimeoutError,
 )
@@ -321,6 +322,124 @@ def list_active_subagents() -> List[Dict[str, Any]]:
             }
             for r in _active_subagents.values()
         ]
+
+
+def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) -> bool:
+    """True when *child_agent* sits below *parent_agent* in the spawn tree."""
+    if child_agent is None or parent_agent is None:
+        return False
+    cur = child_agent
+    for _ in range(max_hops):
+        ref = getattr(cur, "_delegate_parent_ref", None)
+        ancestor = ref() if callable(ref) else None
+        if ancestor is None:
+            return False
+        if ancestor is parent_agent:
+            return True
+        cur = ancestor
+    return False
+
+
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+
+
+def _handle_control_action(
+    action: str,
+    subagent_id: Optional[str],
+    message: Optional[str],
+    parent_agent: Any,
+) -> str:
+    """Synchronously control live descendants of *parent_agent*."""
+    if action == "list":
+        with _active_subagents_lock:
+            records = list(_active_subagents.values())
+        entries = []
+        for record in records:
+            agent = record.get("agent")
+            if not _is_descendant_of(agent, parent_agent):
+                continue
+            started = record.get("started_at")
+            entries.append({
+                "subagent_id": record.get("subagent_id"),
+                "parent_id": record.get("parent_id"),
+                "goal": record.get("goal"),
+                "model": record.get("model"),
+                "status": record.get("status"),
+                "running_seconds": (
+                    round(time.time() - started, 1)
+                    if isinstance(started, (int, float)) else None
+                ),
+                "accepting_steer": bool(record.get("accepting_steer", False)),
+                "live_transcript": getattr(agent, "_live_transcript_path", None),
+            })
+        payload: Dict[str, Any] = {
+            "action": "list", "count": len(entries), "subagents": entries,
+        }
+        if not entries:
+            payload["note"] = (
+                "No live subagents right now. Children that already finished "
+                "have delivered (or will deliver) their results as normal "
+                "completion messages — there is nothing to steer or stop."
+            )
+        return json.dumps(payload, ensure_ascii=False)
+
+    sid = (subagent_id or "").strip()
+    if not sid:
+        return tool_error(
+            f"action='{action}' requires subagent_id (from the spawn dispatch "
+            "response or action='list')."
+        )
+    with _active_subagents_lock:
+        record = _active_subagents.get(sid)
+        target_agent = record.get("agent") if record else None
+    if record is None or not _is_descendant_of(target_agent, parent_agent):
+        return tool_error(
+            f"No live subagent '{sid}' in this conversation's spawn tree. It "
+            "may have already finished (its result arrives as a normal "
+            "completion message). Use action='list' to see live children."
+        )
+
+    if action == "stop":
+        if interrupt_subagent(sid):
+            return json.dumps({
+                "action": "stop", "subagent_id": sid,
+                "status": "interrupt_requested",
+                "note": (
+                    "The subagent stops at its next iteration boundary "
+                    "(in-flight tool calls are asked to cancel). Its partial "
+                    "result still re-enters the conversation as a completion "
+                    "message — do not wait or poll."
+                ),
+            }, ensure_ascii=False)
+        return tool_error(
+            f"Could not interrupt '{sid}' — it likely finished in the last "
+            "moment. Its result arrives as a normal completion message."
+        )
+
+    if action == "steer":
+        text = (message or "").strip()
+        if not text:
+            return tool_error(
+                "action='steer' requires a non-empty 'message' describing the "
+                "course correction."
+            )
+        if steer_subagent(sid, text):
+            return json.dumps({
+                "action": "steer", "subagent_id": sid, "status": "queued",
+                "note": (
+                    "Steering text queued. The subagent sees it appended to "
+                    "its next tool result — the current tool call is never cut. "
+                    "If the child finishes first, the text is reported back as "
+                    "missed_steer in its completion entry."
+                ),
+            }, ensure_ascii=False)
+        return tool_error(
+            f"Subagent '{sid}' is no longer accepting steering (finishing or "
+            "already finished). Its result arrives as a normal completion "
+            "message; re-delegate a follow-up task if more work is needed."
+        )
+
+    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
 
 
 def _extract_output_tail(
@@ -1843,6 +1962,12 @@ def _build_child_agent(
         if agent_definition is not None
         else None
     )
+    # Scope model-facing live control to this parent's spawn tree. A weakref
+    # avoids keeping a finished parent alive for a detached child.
+    try:
+        setattr(child, "_delegate_parent_ref", weakref.ref(parent_agent))
+    except TypeError:
+        setattr(child, "_delegate_parent_ref", None)
     # Profile-mode definition guidance belongs to the cached system-message
     # tier, not the ephemeral task framing. _run_single_child threads this
     # immutable value through every prompt rebuild.
@@ -3326,6 +3451,9 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
+    action: Optional[str] = None,
+    subagent_id: Optional[str] = None,
+    message: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3344,6 +3472,16 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    normalized_action = (action or "").strip().lower()
+    if normalized_action in _CONTROL_ACTIONS:
+        return _handle_control_action(
+            normalized_action, subagent_id, message, parent_agent
+        )
+    if normalized_action and normalized_action != "spawn":
+        return tool_error(
+            f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+        )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -3412,6 +3550,10 @@ def delegate_task(
         return tool_error(tasks_error)
     if recovered_tasks is not None:
         tasks = recovered_tasks
+
+    # Treat an empty batch emitted alongside a single goal as no batch.
+    if isinstance(tasks, list) and not tasks:
+        tasks = None
 
     if tasks and isinstance(tasks, list):
         if len(tasks) > max_children:
@@ -4080,6 +4222,17 @@ def delegate_task(
                 "goals": _goals,
                 "note": note,
             }
+            subagent_ids = [
+                getattr(child, "_subagent_id", None) for child in _child_agents
+            ]
+            if any(isinstance(sid, str) and sid for sid in subagent_ids):
+                payload["subagent_ids"] = subagent_ids
+                payload["control_hint"] = (
+                    "While a child runs you can orchestrate it live with this "
+                    "same tool: delegate_task(action='list') to see live "
+                    "children, action='steer' with subagent_id + message to "
+                    "redirect one, action='stop' with subagent_id to end one early."
+                )
             if live_paths:
                 payload["live_transcripts"] = list(live_paths)
                 payload["live_transcripts_hint"] = (
@@ -4390,6 +4543,9 @@ def _build_top_level_description() -> str:
         "transcript paths, and the completed result (one consolidated message "
         "for a batch) re-enters the conversation on its own. Do NOT wait or "
         "poll; continue other work.\n\n"
+        "LIVE ORCHESTRATION: while children run, this tool also controls "
+        "them — action='list' (live children + ids), action='steer' "
+        "(subagent_id + message), action='stop' (subagent_id).\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
         "with intermediate data, or independent parallel workstreams.\n"
         "DO NOT USE FOR (use these instead):\n"
@@ -4599,6 +4755,22 @@ DELEGATE_TASK_SCHEMA = {
                     "backward compatibility."
                 ),
             },
+            "action": {
+                "type": "string",
+                "enum": ["spawn", "list", "steer", "stop"],
+                "description": (
+                    "Omit for normal delegation. Use list/steer/stop to control "
+                    "running subagents in this conversation."
+                ),
+            },
+            "subagent_id": {
+                "type": "string",
+                "description": "Target id for action='steer' or action='stop'.",
+            },
+            "message": {
+                "type": "string",
+                "description": "Course correction for action='steer'.",
+            },
         },
         "required": [],
     },
@@ -4661,6 +4833,9 @@ registry.register(
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
         output_schema=args.get("output_schema"),
+        action=args.get("action"),
+        subagent_id=args.get("subagent_id"),
+        message=args.get("message"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,
