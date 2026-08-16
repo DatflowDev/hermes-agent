@@ -1677,11 +1677,30 @@ def _build_child_agent(
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
 
+    parent_session_db = getattr(parent_agent, "_session_db", None)
+    child_session_db = None
+    if parent_session_db is not None:
+        try:
+            from hermes_state import SessionDB
+
+            parent_db_path = getattr(parent_session_db, "db_path", None)
+            child_session_db = (
+                SessionDB(db_path=parent_db_path)
+                if parent_db_path is not None
+                else SessionDB()
+            )
+        except Exception:
+            logger.debug(
+                "subagent: failed to open dedicated SessionDB; child persistence disabled",
+                exc_info=True,
+            )
+
     from agent.delegation_context import delegated_child_context
 
     with delegated_child_context():
-        child = AIAgent(
-            base_url=effective_base_url,
+        try:
+            child = AIAgent(
+                base_url=effective_base_url,
             api_key=effective_api_key,
             model=effective_model,
             provider=effective_provider,
@@ -1712,7 +1731,7 @@ def _build_child_agent(
             skip_memory=True,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
-            session_db=getattr(parent_agent, "_session_db", None),
+            session_db=child_session_db,
             parent_session_id=getattr(parent_agent, "session_id", None),
             providers_allowed=child_providers_allowed,
             providers_ignored=child_providers_ignored,
@@ -1728,8 +1747,14 @@ def _build_child_agent(
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,
             iteration_budget=None,  # fresh budget per subagent
-            **child_optional_kwargs,
-        )
+                **child_optional_kwargs,
+            )
+        except BaseException:
+            if child_session_db is not None:
+                child_session_db.close()
+            raise
+    if child_session_db is not None:
+        child._owns_session_db = True
     if exact_tool_allowlist is not None:
         import model_tools
         from tools.tool_search import assemble_tool_defs
