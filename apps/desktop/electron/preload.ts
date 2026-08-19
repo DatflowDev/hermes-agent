@@ -4,6 +4,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   getConnection: profile => ipcRenderer.invoke('hermes:connection', profile),
   // Registry-scoped backend resolution: { connectionId, profile } → descriptor.
   getConnectionFor: payload => ipcRenderer.invoke('hermes:connection:for', payload),
+  getProfileRoutes: profiles => ipcRenderer.invoke('hermes:plugin-profile-routes', profiles),
   revalidateConnection: () => ipcRenderer.invoke('hermes:connection:revalidate'),
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
@@ -206,6 +207,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   setPreviewShortcutActive: active => ipcRenderer.send('hermes:previewShortcutActive', Boolean(active)),
   openExternal: url => ipcRenderer.invoke('hermes:openExternal', url),
   openPreviewInBrowser: url => ipcRenderer.invoke('hermes:openPreviewInBrowser', url),
+  reachPreviewUrl: url => ipcRenderer.invoke('hermes:preview:reach', url),
   fetchLinkTitle: url => ipcRenderer.invoke('hermes:fetchLinkTitle', url),
   sanitizeWorkspaceCwd: cwd => ipcRenderer.invoke('hermes:workspace:sanitize', cwd),
   settings: {
@@ -296,6 +298,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
 
     return () => ipcRenderer.removeListener('hermes:close-preview-requested', listener)
   },
+  onPreviewNav: callback => {
+    const listener = (_event, command) => callback(command)
+    ipcRenderer.on('hermes:preview-nav', listener)
+
+    return () => ipcRenderer.removeListener('hermes:preview-nav', listener)
+  },
   onOpenFolderRequested: callback => {
     const listener = () => callback()
     ipcRenderer.on('hermes:open-folder-requested', listener)
@@ -315,6 +323,8 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     return () => ipcRenderer.removeListener('hermes:deep-link', listener)
   },
   signalDeepLinkReady: () => ipcRenderer.invoke('hermes:deep-link-ready'),
+  probePluginRepo: payload => ipcRenderer.invoke('hermes:plugin:probe', payload),
+  installDesktopPlugin: payload => ipcRenderer.invoke('hermes:plugin:installDesktop', payload),
   onWindowStateChanged: callback => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('hermes:window-state-changed', listener)
@@ -332,6 +342,12 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
     ipcRenderer.on('hermes:notification-action', listener)
 
     return () => ipcRenderer.removeListener('hermes:notification-action', listener)
+  },
+  onNotificationActivate: callback => {
+    const listener = (_event, payload) => callback(payload)
+    ipcRenderer.on('hermes:notification-activate', listener)
+
+    return () => ipcRenderer.removeListener('hermes:notification-activate', listener)
   },
   onPreviewFileChanged: callback => {
     const listener = (_event, payload) => callback(payload)
