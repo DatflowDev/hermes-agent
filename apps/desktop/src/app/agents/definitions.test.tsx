@@ -51,25 +51,27 @@ describe('AgentDefinitions', () => {
   })
 
   it('launches through the typed session-bound RPC', async () => {
-    requestGatewayMock.mockResolvedValueOnce({
-      version: 2,
-      revision: 'abc',
-      definitions: [
-        {
-          definition_id: 'definition-1',
-          name: 'researcher',
-          description: 'Verify sources',
-          identity: 'replace',
-          provider: null,
-          model: null,
-          fallback_count: 0,
-          tools_allow: null,
-          mcp_allow: null,
-          relative_path: 'researcher.md',
-          digest: 'a'.repeat(64)
-        }
-      ]
-    }).mockResolvedValueOnce({ status: 'dispatched' })
+    requestGatewayMock
+      .mockResolvedValueOnce({
+        version: 2,
+        revision: 'abc',
+        definitions: [
+          {
+            definition_id: 'definition-1',
+            name: 'researcher',
+            description: 'Verify sources',
+            identity: 'replace',
+            provider: null,
+            model: null,
+            fallback_count: 0,
+            tools_allow: null,
+            mcp_allow: null,
+            relative_path: 'researcher.md',
+            digest: 'a'.repeat(64)
+          }
+        ]
+      })
+      .mockResolvedValueOnce({ status: 'dispatched' })
 
     render(<AgentDefinitions />)
     const taskInput = await screen.findByLabelText('Task for researcher')
@@ -99,25 +101,27 @@ describe('AgentDefinitions', () => {
   })
 
   it('announces launch failures as alerts', async () => {
-    requestGatewayMock.mockResolvedValueOnce({
-      version: 2,
-      revision: 'abc',
-      definitions: [
-        {
-          definition_id: 'definition-1',
-          name: 'researcher',
-          description: 'Verify sources',
-          identity: 'replace',
-          provider: null,
-          model: null,
-          fallback_count: 0,
-          tools_allow: null,
-          mcp_allow: null,
-          relative_path: 'researcher.md',
-          digest: 'a'.repeat(64)
-        }
-      ]
-    }).mockRejectedValueOnce(new Error('routing denied'))
+    requestGatewayMock
+      .mockResolvedValueOnce({
+        version: 2,
+        revision: 'abc',
+        definitions: [
+          {
+            definition_id: 'definition-1',
+            name: 'researcher',
+            description: 'Verify sources',
+            identity: 'replace',
+            provider: null,
+            model: null,
+            fallback_count: 0,
+            tools_allow: null,
+            mcp_allow: null,
+            relative_path: 'researcher.md',
+            digest: 'a'.repeat(64)
+          }
+        ]
+      })
+      .mockRejectedValueOnce(new Error('routing denied'))
 
     render(<AgentDefinitions />)
     fireEvent.change(await screen.findByLabelText('Task for researcher'), { target: { value: 'Check' } })

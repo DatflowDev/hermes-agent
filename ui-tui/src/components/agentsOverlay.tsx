@@ -1012,9 +1012,7 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, sessionId,
             </Text>
           ) : null}
         </Text>
-        <Text color={t.color.muted}>
-          {surface === 'runs' ? 'Runs' : 'Definitions'} · d switch
-        </Text>
+        <Text color={t.color.muted}>{surface === 'runs' ? 'Runs' : 'Definitions'} · d switch</Text>
       </Box>
 
       {surface === 'definitions' ? (
