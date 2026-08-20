@@ -1314,11 +1314,16 @@ def handle_function_call(
             ) or []
             if enabled_tools is not None:
                 allowed_names = set(enabled_tools)
-                current_defs = [
-                    tool
-                    for tool in current_defs
-                    if (tool.get("function") or {}).get("name") in allowed_names
-                ]
+                # After progressive disclosure, enabled_tools is the model-
+                # visible bridge list; filtering the pre-assembly catalog by
+                # it would erase every deferred MCP/plugin tool. Exact raw
+                # allowlists do not contain bridge names and remain narrowed.
+                if not (_ts_mod.BRIDGE_TOOL_NAMES & allowed_names):
+                    current_defs = [
+                        tool
+                        for tool in current_defs
+                        if (tool.get("function") or {}).get("name") in allowed_names
+                    ]
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:

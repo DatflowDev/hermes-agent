@@ -391,6 +391,21 @@ class _ManagedToolResult:
     dispatched: bool
 
 
+def _execution_authorized_tool_names(agent) -> list[str]:
+    """Return model-visible plus scoped deferred execution authority."""
+    names = set(getattr(agent, "valid_tool_names", ()) or ())
+    names.update(getattr(agent, "_raw_authorized_tool_names", ()) or ())
+    if getattr(agent, "_exact_tool_allowlist", None) is None:
+        try:
+            from tools.tool_search import BRIDGE_TOOL_NAMES
+
+            if BRIDGE_TOOL_NAMES & names:
+                names.update(_tool_search_scoped_names(agent))
+        except Exception:
+            pass
+    return list(names)
+
+
 class _ToolTimeoutResult(str):
     """Marker for a synthesized sequential-tool timeout result."""
 
@@ -2387,11 +2402,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             turn_id=getattr(agent, "_current_turn_id", "") or "",
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
-                            enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
-                                else None
-                            ),
+                            enabled_tools=_execution_authorized_tool_names(agent),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,
@@ -2469,11 +2480,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                             turn_id=getattr(agent, "_current_turn_id", "") or "",
                             api_request_id=getattr(agent, "_current_api_request_id", "")
                             or "",
-                            enabled_tools=(
-                                list(agent.valid_tool_names)
-                                if agent.valid_tool_names
-                                else None
-                            ),
+                            enabled_tools=_execution_authorized_tool_names(agent),
                             skip_pre_tool_call_hook=True,
                             skip_tool_request_middleware=True,
                             skip_tool_execution_middleware=True,

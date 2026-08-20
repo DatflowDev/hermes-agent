@@ -578,6 +578,23 @@ class TestRegression_ToolsetScoping:
 
         assert {match["name"] for match in parsed["matches"]} == {"mcp_exact_allowed"}
 
+    def test_search_catalog_survives_bridge_only_visible_authority(self):
+        import model_tools
+
+        self._register("mcp_bridge_visible_op", "mcp-bridge-visible")
+        parsed = json.loads(
+            model_tools.handle_function_call(
+                function_name="tool_search",
+                function_args={"query": "mcp_bridge_visible_op", "limit": 10},
+                enabled_tools=["tool_search", "tool_describe", "tool_call"],
+                enabled_toolsets=["mcp-bridge-visible"],
+            )
+        )
+
+        assert {match["name"] for match in parsed["matches"]} == {
+            "mcp_bridge_visible_op"
+        }
+
 
     def test_scoped_deferrable_names_helper(self):
         from tools.tool_search import scoped_deferrable_names

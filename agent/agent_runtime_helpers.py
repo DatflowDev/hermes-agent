@@ -3061,7 +3061,33 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
     # agent-owned tools bypass model_tools.handle_function_call entirely, so
     # preserving ``enabled_tools=[]`` at the registry boundary is not enough.
     # The immutable per-agent name snapshot is authoritative here too.
-    valid_tool_names = set(getattr(agent, "valid_tool_names", ()) or ())
+    valid_tool_names: set[str] = set(getattr(agent, "valid_tool_names", ()) or ())
+    valid_tool_names.update(
+        getattr(agent, "_raw_authorized_tool_names", ()) or ()
+    )
+    if function_name not in valid_tool_names:
+        # HTTP MCP servers can finish connecting after the immutable startup
+        # snapshot is captured. If progressive disclosure is active, accept a
+        # late tool only when it is present in the current toolset-scoped
+        # deferred catalog; this does not widen exact raw allowlists.
+        try:
+            from tools.tool_search import BRIDGE_TOOL_NAMES, scoped_deferrable_names
+
+            exact_allowlist = getattr(agent, "_exact_tool_allowlist", None)
+            bridge_visible = bool(
+                BRIDGE_TOOL_NAMES
+                & set(getattr(agent, "valid_tool_names", ()) or ())
+            )
+            if bridge_visible and exact_allowlist is None:
+                scoped_defs = _ra().get_tool_definitions(
+                    enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+                    disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+                    quiet_mode=True,
+                    skip_tool_search_assembly=True,
+                ) or []
+                valid_tool_names.update(scoped_deferrable_names(scoped_defs))
+        except Exception:
+            pass
     if function_name not in valid_tool_names:
         from model_tools import tool_error
 
@@ -3292,10 +3318,9 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             # ``agent.tools`` / ``valid_tool_names`` are model-facing and may
             # contain only the three tool-search bridges. The underlying MCP
             # names remain authorized in the pre-deferred snapshot.
-            execution_authority = set(agent.valid_tool_names)
-            execution_authority.update(
-                getattr(agent, "_raw_authorized_tool_names", ()) or ()
-            )
+            # Reuse the authority set validated above. It also contains late
+            # MCP tools admitted from the current scoped deferred catalog.
+            execution_authority = set(valid_tool_names)
             dispatch_kwargs = dict(
                 tool_call_id=tool_call_id,
                 session_id=agent.session_id or "",
