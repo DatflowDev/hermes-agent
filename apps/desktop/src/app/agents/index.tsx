@@ -114,7 +114,7 @@ export function AgentsView({ onClose }: AgentsViewProps) {
       ) : tree.length === 0 ? (
         <PanelEmpty description={t.agents.emptyDesc} icon="hubot" title={t.agents.emptyTitle} />
       ) : (
-          <SubagentTree tree={tree} />
+        <SubagentTree tree={tree} />
       )}
     </Panel>
   )

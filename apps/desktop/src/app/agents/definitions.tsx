@@ -55,6 +55,7 @@ export function AgentDefinitions() {
   const launch = useCallback(
     async (definition: AgentDefinitionProjection) => {
       const task = (tasks[definition.definition_id] ?? '').trim()
+
       if (!sessionId || !task) {
         return
       }
@@ -89,7 +90,11 @@ export function AgentDefinitions() {
   }, [load])
 
   if (loading) {
-    return <p aria-live="polite" className="py-8 text-center text-xs text-muted-foreground">Loading definitions…</p>
+    return (
+      <p aria-live="polite" className="py-8 text-center text-xs text-muted-foreground">
+        Loading definitions…
+      </p>
+    )
   }
 
   if (error) {
@@ -97,7 +102,11 @@ export function AgentDefinitions() {
       <div className="grid place-items-center gap-3 py-8 text-center" role="alert">
         <p className="text-sm text-destructive">Could not load agent definitions.</p>
         <p className="text-xs text-muted-foreground">{error}</p>
-        <button className="text-xs text-foreground underline underline-offset-4" onClick={() => void load()} type="button">
+        <button
+          className="text-xs text-foreground underline underline-offset-4"
+          onClick={() => void load()}
+          type="button"
+        >
           Retry
         </button>
       </div>
@@ -128,46 +137,55 @@ export function AgentDefinitions() {
         </p>
       ) : null}
       <ul className="space-y-1" role="list">
-      {definitions.map(definition => {
-        const route = [definition.provider, definition.model].filter(Boolean).join(' / ') || 'inherits delegation route'
+        {definitions.map(definition => {
+          const route =
+            [definition.provider, definition.model].filter(Boolean).join(' / ') || 'inherits delegation route'
 
-        return (
-          <li className="rounded-md px-3 py-2.5 hover:bg-muted/40" key={`${definition.name}:${definition.digest}`}>
-            <div className="flex min-w-0 items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="truncate text-sm font-medium text-foreground">{definition.name}</p>
-                <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{definition.description}</p>
+          return (
+            <li className="rounded-md px-3 py-2.5 hover:bg-muted/40" key={`${definition.name}:${definition.digest}`}>
+              <div className="flex min-w-0 items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-medium text-foreground">{definition.name}</p>
+                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{definition.description}</p>
+                </div>
+                <span className="shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[0.65rem] text-muted-foreground">
+                  {definition.identity}
+                </span>
               </div>
-              <span className="shrink-0 rounded border border-border px-1.5 py-0.5 font-mono text-[0.65rem] text-muted-foreground">
-                {definition.identity}
-              </span>
-            </div>
-            <p className="mt-2 truncate font-mono text-[0.65rem] text-muted-foreground/75">
-              {route} · {definition.fallback_count} fallback{definition.fallback_count === 1 ? '' : 's'} · {definition.relative_path}
-            </p>
-            <p className="mt-1 truncate font-mono text-[0.65rem] text-muted-foreground/75">
-              tools: {definition.tools_allow?.join(', ') ?? 'inherit'} · MCP: {definition.mcp_allow?.join(', ') ?? 'inherit'}
-            </p>
-            <div className="mt-2 flex gap-2">
-              <input
-                aria-label={`Task for ${definition.name}`}
-                className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 text-xs"
-                onChange={event => setTasks(current => ({ ...current, [definition.definition_id]: event.target.value }))}
-                placeholder="Task for this agent"
-                value={tasks[definition.definition_id] ?? ''}
-              />
-              <button
-                className="rounded bg-foreground px-2 py-1 text-xs text-background disabled:opacity-50"
-                disabled={!sessionId || !(tasks[definition.definition_id] ?? '').trim() || launching === definition.definition_id}
-                onClick={() => void launch(definition)}
-                type="button"
-              >
-                {launching === definition.definition_id ? 'Launching…' : 'Launch'}
-              </button>
-            </div>
-          </li>
-        )
-      })}
+              <p className="mt-2 truncate font-mono text-[0.65rem] text-muted-foreground/75">
+                {route} · {definition.fallback_count} fallback{definition.fallback_count === 1 ? '' : 's'} ·{' '}
+                {definition.relative_path}
+              </p>
+              <p className="mt-1 truncate font-mono text-[0.65rem] text-muted-foreground/75">
+                tools: {definition.tools_allow?.join(', ') ?? 'inherit'} · MCP:{' '}
+                {definition.mcp_allow?.join(', ') ?? 'inherit'}
+              </p>
+              <div className="mt-2 flex gap-2">
+                <input
+                  aria-label={`Task for ${definition.name}`}
+                  className="min-w-0 flex-1 rounded border border-border bg-background px-2 py-1 text-xs"
+                  onChange={event =>
+                    setTasks(current => ({ ...current, [definition.definition_id]: event.target.value }))
+                  }
+                  placeholder="Task for this agent"
+                  value={tasks[definition.definition_id] ?? ''}
+                />
+                <button
+                  className="rounded bg-foreground px-2 py-1 text-xs text-background disabled:opacity-50"
+                  disabled={
+                    !sessionId ||
+                    !(tasks[definition.definition_id] ?? '').trim() ||
+                    launching === definition.definition_id
+                  }
+                  onClick={() => void launch(definition)}
+                  type="button"
+                >
+                  {launching === definition.definition_id ? 'Launching…' : 'Launch'}
+                </button>
+              </div>
+            </li>
+          )
+        })}
       </ul>
     </div>
   )
